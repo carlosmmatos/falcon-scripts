@@ -25,13 +25,7 @@ main() {
         print_usage
         exit 1
     fi
-    echo -n 'Falcon Sensor Install  ... '; cs_sensor_install;  echo '[ Ok ]'
-    # Run if FALCON_INSTALL_ONLY is not set or is set to false
-    if [ -z "$FALCON_INSTALL_ONLY" ] || [ "${FALCON_INSTALL_ONLY}" = "false" ]; then
-        echo -n 'Falcon Sensor Register ... '; cs_sensor_register; echo '[ Ok ]'
-        echo -n 'Falcon Sensor Restart  ... '; cs_sensor_restart;  echo '[ Ok ]'
-    fi
-    echo 'Falcon Sensor installed successfully.'
+    cs_sensor_install
 }
 
 cs_sensor_register() {
@@ -58,14 +52,16 @@ cs_sensor_restart() {
 }
 
 cs_sensor_install() {
-    tempdir=$(mktemp -d)
+    tempdir=/tmp
 
     tempdir_cleanup() { rm -rf "$tempdir"; }; trap tempdir_cleanup EXIT
 
     package_name=$(cs_sensor_download "$tempdir")
-    os_install_package "$package_name"
+    # os_install_package "$package_name"
 
-    tempdir_cleanup
+    echo $package_name
+
+    # tempdir_cleanup
 }
 
 cs_sensor_remove() {
