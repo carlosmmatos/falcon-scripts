@@ -473,16 +473,11 @@ cs_falcon_oauth_token=$(
 region_hint=$(grep -i ^x-cs-region: "$response_headers" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
 rm "${response_headers}"
 
-if [ -z "${FALCON_CLOUD}" ]; then
-    if [ -z "${region_hint}" ]; then
-        die "Unable to obtain region hint from CrowdStrike Falcon OAuth API, Please provide FALCON_CLOUD environment variable as an override."
-    fi
-    cs_falcon_cloud="${region_hint}"
-else
-    if [ "x${FALCON_CLOUD}" != "x${region_hint}" ]; then
-        echo "WARNING: FALCON_CLOUD='${FALCON_CLOUD}' environment variable specified while credentials only exists in '${region_hint}'" >&2
-    fi
+if [ -z "${region_hint}" ]; then
+    die "Unable to obtain region hint from CrowdStrike Falcon OAuth API, Please provide FALCON_CLOUD environment variable as an override."
 fi
+
+cs_falcon_cloud="${region_hint}"
 
 cs_falcon_cid=$(
     if [ -n "$FALCON_CID" ]; then
