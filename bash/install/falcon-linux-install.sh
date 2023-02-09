@@ -4,10 +4,11 @@ print_usage() {
     cat <<EOF
 This script installs and configures the CrowdStrike Falcon Sensor for Linux.
 
-CrowdStrike API credentials are needed to download Falcon sensor. The script recognizes the following environmental variables:
+CrowdStrike API credentials are needed to download Falcon sensor. The script recognizes the following environmental variables and flags:
+** Note: Flags take precedence over environmental variables.
 
-    - FALCON_CLIENT_ID
-    - FALCON_CLIENT_SECRET
+    --client-id <falcon-client-id> | FALCON_CLIENT_ID
+    --client-secret <falcon-client-secret> | FALCON_CLIENT_SECRET
 
 Optional:
     - FALCON_CID                        (default: auto)
@@ -28,10 +29,10 @@ EOF
 }
 
 main() {
-    if [ -n "$1" ]; then
-        print_usage
-        exit 1
-    fi
+    # if [ -n "$1" ]; then
+    #     print_usage
+    #     exit 1
+    # fi
     echo -n 'Check if Falcon Sensor is running ...'; cs_sensor_is_running; echo '[ Not present ]'
     echo -n 'Falcon Sensor Install  ... '; cs_sensor_install;  echo '[ Ok ]'
     # Run if FALCON_INSTALL_ONLY is not set or is set to false
@@ -434,6 +435,109 @@ curl_command() {
     fi
 }
 
+while [ $# != 0]; do
+    case "$1" in
+        --client-id)
+            if [ -n "${2:-}" ]; then
+                FALCON_CLIENT_ID="${2}"
+                shift
+            fi
+            ;;
+        --client-secret)
+            if [ -n "${2:-}" ]; then
+                FALCON_CLIENT_SECRET="${2}"
+                shift
+            fi
+            ;;
+        --cid)
+            if [ -n "${2:-}" ]; then
+                FALCON_CID="${2}"
+                shift
+            fi
+            ;;
+        --cloud)
+            if [ -n "${2:-}" ]; then
+                FALCON_CLOUD="${2}"
+                shift
+            fi
+            ;;
+        --sensor-version-decrement)
+            if [ -n "${2:-}" ]; then
+                FALCON_SENSOR_VERSION_DECREMENT="${2}"
+                shift
+            fi
+            ;;
+        --provisioning-token)
+            if [ -n "${2:-}" ]; then
+                FALCON_PROVISIONING_TOKEN="${2}"
+                shift
+            fi
+            ;;
+        --sensor-update-policy-name)
+            if [ -n "${2:-}" ]; then
+                FALCON_SENSOR_UPDATE_POLICY_NAME="${2}"
+                shift
+            fi
+            ;;
+        --tags)
+            if [ -n "${2:-}" ]; then
+                FALCON_TAGS="${2}"
+                shift
+            fi
+            ;;
+        --apd)
+            if [ -n "${2:-}" ]; then
+                FALCON_APD="${2}"
+                shift
+            fi
+            ;;
+        --aph)
+            if [ -n "${2:-}" ]; then
+                FALCON_APH="${2}"
+                shift
+            fi
+            ;;
+        --app)
+            if [ -n "${2:-}" ]; then
+                FALCON_APP="${2}"
+                shift
+            fi
+            ;;
+        --billing)
+            if [ -n "${2:-}" ]; then
+                FALCON_BILLING="${2}"
+                shift
+            fi
+            ;;
+        --backend)
+            if [ -n "${2:-}" ]; then
+                FALCON_BACKEND="${2}"
+                shift
+            fi
+            ;;
+        --trace)
+            if [ -n "${2:-}" ]; then
+                FALCON_TRACE="${2}"
+                shift
+            fi
+            ;;
+        --uninstall)
+            FALCON_UNINSTALL="true"
+            ;;
+        --install-only)
+            FALCON_INSTALL_ONLY="true"
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            die "Unrecognized argument: $1"
+            ;;
+    esac
+    shift
+done
+
 # shellcheck disable=SC2034
 cs_uninstall=$(
     if [ "$FALCON_UNINSTALL" ]; then
@@ -703,4 +807,5 @@ if [ -n "$FALCON_TRACE" ]; then
     )
 fi
 
-main "$@"
+# Start main
+main
