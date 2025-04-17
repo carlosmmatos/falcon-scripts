@@ -2,6 +2,116 @@
 
 VERSION="1.0.0"
 
+# Default log file and recovery file paths
+LOG_FILE="/var/log/falcon_migrate.log"
+RECOVERY_FILE="/var/run/falcon_migrate_recovery.json"
+
+# Function to log messages to console and log file
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+    
+    # Create log message with timestamp
+    local log_message="[${timestamp}] [${level}] ${message}"
+    
+    # Print to console
+    echo "$log_message"
+    
+    # Append to log file if set
+    if [ -n "$LOG_FILE" ]; then
+        echo "$log_message" >> "$LOG_FILE"
+    fi
+}
+
+# Function to log info level messages
+log_info() {
+    log "INFO" "$1"
+}
+
+# Function to log warning level messages
+log_warning() {
+    log "WARNING" "$1"
+}
+
+# Function to log error level messages
+log_error() {
+    log "ERROR" "$1"
+}
+
+# Function to save recovery information
+save_recovery_info() {
+    if [ -n "$RECOVERY_FILE" ]; then
+        # Create JSON structure with important recovery information
+        cat > "$RECOVERY_FILE" <<EOF
+{
+  "timestamp": "$(date +"%Y-%m-%d %H:%M:%S")",
+  "aid": "$aid",
+  "tags": $( [ -n "$existing_tags" ] && echo "\"$existing_tags\"" || echo "null" ),
+  "cid": "$new_cid"
+}
+EOF
+        log_info "Saved recovery information to $RECOVERY_FILE"
+    fi
+}
+
+# Function to load recovery information if available
+load_recovery_info() {
+    if [ -f "$RECOVERY_FILE" ]; then
+        log_info "Found recovery file $RECOVERY_FILE, loading data"
+        
+        # Parse the recovery file to extract data
+        recovered_aid=$(grep -o '"aid":.*",' "$RECOVERY_FILE" | cut -d'"' -f4)
+        recovered_tags=$(grep -o '"tags":.*",' "$RECOVERY_FILE" | cut -d'"' -f4 || echo "")
+        recovered_cid=$(grep -o '"cid":.*"' "$RECOVERY_FILE" | cut -d'"' -f4)
+        
+        if [ -n "$recovered_aid" ]; then
+            log_info "Recovered AID: $recovered_aid"
+            aid="$recovered_aid"
+        fi
+        
+        if [ -n "$recovered_tags" ] && [ "$recovered_tags" != "null" ]; then
+            log_info "Recovered tags: $recovered_tags"
+            existing_tags="$recovered_tags"
+        fi
+        
+        if [ -n "$recovered_cid" ]; then
+            log_info "Recovered CID: $recovered_cid"
+            new_cid="$recovered_cid"
+        fi
+        
+        return 0
+    else
+        log_info "No recovery file found at $RECOVERY_FILE"
+        return 1
+    fi
+}
+
+# Function to handle fatal errors
+die() {
+    log_error "$1"
+    exit 1
+}
+
+# Handle CURL errors
+handle_curl_error() {
+    local exit_code=$1
+    if [ "$exit_code" -ne 0 ]; then
+        if [ "$exit_code" -eq 7 ]; then
+            log_error "Failed to connect to server. Please check your network connectivity and proxy settings."
+        elif [ "$exit_code" -eq 22 ]; then
+            log_error "HTTP error from server. The server rejected the request."
+        elif [ "$exit_code" -eq 28 ]; then
+            log_error "Connection timed out. Server might be unreachable."
+        else
+            log_error "CURL error code: $exit_code. Please check your connectivity."
+        fi
+        return 1
+    fi
+    return 0
+}
+
 print_usage() {
     cat <<EOF
 
@@ -12,45 +122,45 @@ Version: $VERSION
 
 This script recognizes the following environmental variables:
 
-Source CID Authentication:
-    - SOURCE_FALCON_CLIENT_ID                  (default: unset)
-        Your source CrowdStrike Falcon API client ID.
+Existing CID Authentication:
+    - EXISTING_FALCON_CLIENT_ID                (default: unset)
+        Your existing CrowdStrike Falcon API client ID.
 
-    - SOURCE_FALCON_CLIENT_SECRET              (default: unset)
-        Your source CrowdStrike Falcon API client secret.
+    - EXISTING_FALCON_CLIENT_SECRET            (default: unset)
+        Your existing CrowdStrike Falcon API client secret.
 
-    - SOURCE_FALCON_ACCESS_TOKEN               (default: unset)
-        Your source CrowdStrike Falcon API access token.
-        If used, SOURCE_FALCON_CLOUD must also be set.
+    - EXISTING_FALCON_ACCESS_TOKEN             (default: unset)
+        Your existing CrowdStrike Falcon API access token.
+        If used, EXISTING_FALCON_CLOUD must also be set.
 
-    - SOURCE_FALCON_CLOUD                      (default: unset)
-        The cloud region where your source CrowdStrike Falcon instance is hosted.
-        Required if using SOURCE_FALCON_ACCESS_TOKEN.
+    - EXISTING_FALCON_CLOUD                    (default: unset)
+        The cloud region where your existing CrowdStrike Falcon instance is hosted.
+        Required if using EXISTING_FALCON_ACCESS_TOKEN.
         Accepted values are ['us-1', 'us-2', 'eu-1', 'us-gov-1'].
 
-Target CID Authentication:
-    - TARGET_FALCON_CLIENT_ID                  (default: unset)
-        Your target CrowdStrike Falcon API client ID.
+New CID Authentication:
+    - NEW_FALCON_CLIENT_ID                     (default: unset)
+        Your new CrowdStrike Falcon API client ID.
 
-    - TARGET_FALCON_CLIENT_SECRET              (default: unset)
-        Your target CrowdStrike Falcon API client secret.
+    - NEW_FALCON_CLIENT_SECRET                 (default: unset)
+        Your new CrowdStrike Falcon API client secret.
 
-    - TARGET_FALCON_ACCESS_TOKEN               (default: unset)
-        Your target CrowdStrike Falcon API access token.
-        If used, TARGET_FALCON_CLOUD must also be set.
+    - NEW_FALCON_ACCESS_TOKEN                  (default: unset)
+        Your new CrowdStrike Falcon API access token.
+        If used, NEW_FALCON_CLOUD must also be set.
 
-    - TARGET_FALCON_CLOUD                      (default: unset)
-        The cloud region where your target CrowdStrike Falcon instance is hosted.
-        Required if using TARGET_FALCON_ACCESS_TOKEN.
+    - NEW_FALCON_CLOUD                         (default: unset)
+        The cloud region where your new CrowdStrike Falcon instance is hosted.
+        Required if using NEW_FALCON_ACCESS_TOKEN.
         Accepted values are ['us-1', 'us-2', 'eu-1', 'us-gov-1'].
 
 Migration Options:
     - MIGRATE_TAGS                             (default: false)
-        Migrate the host's existing tags to the target CID.
+        Migrate the host's existing tags to the new CID.
         Accepted values are ['true', 'false'].
 
-    - TARGET_FALCON_TAGS                       (default: unset)
-        A comma separated list of tags for the sensor in the target CID.
+    - NEW_FALCON_TAGS                          (default: unset)
+        A comma separated list of tags for the sensor in the new CID.
         If MIGRATE_TAGS is true, these tags will be added in addition to the existing tags.
 
 Other Options:
@@ -59,7 +169,7 @@ Other Options:
         If not provided, the script will try to retrieve it from the API.
 
     - FALCON_PROVISIONING_TOKEN                (default: unset)
-        The provisioning token to use for installing the sensor in the target CID.
+        The provisioning token to use for installing the sensor in the new CID.
         If not provided, the script will try to retrieve it from the API.
 
     - FALCON_SENSOR_UPDATE_POLICY_NAME         (default: unset)
@@ -106,43 +216,451 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     exit 0
 fi
 
+# Function to set up all required variables
+setup_variables() {
+    log_info "Setting up variables for migration..."
+    
+    # Try to load recovery information from a previous run
+    load_recovery_info
+    
+    # Detect OS information
+    detect_os
+    
+    # Set default values if not already set
+    MIGRATE_TAGS="${MIGRATE_TAGS:-false}"
+    
+    # Log configuration
+    log_info "Migration configuration:"
+    log_info "OS: ${os_name} ${cs_os_version}"
+    log_info "Migrate tags: ${MIGRATE_TAGS}"
+    if [ -n "$NEW_FALCON_TAGS" ]; then
+        log_info "New tags: ${NEW_FALCON_TAGS}"
+    fi
+}
+
+# Detect OS name and version
+detect_os() {
+    log_info "Detecting operating system..."
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        os_name="$NAME"
+        cs_os_version="$VERSION_ID"
+        cs_os_name="$ID"
+    elif type lsb_release >/dev/null 2>&1; then
+        os_name=$(lsb_release -s -d)
+        cs_os_version=$(lsb_release -s -r)
+        cs_os_name=$(lsb_release -s -i | tr '[:upper:]' '[:lower:]')
+    elif [ -f /etc/lsb-release ]; then
+        . /etc/lsb-release
+        os_name="$DISTRIB_DESCRIPTION"
+        cs_os_version="$DISTRIB_RELEASE"
+        cs_os_name="$DISTRIB_ID"
+    elif [ -f /etc/redhat-release ]; then
+        os_name=$(cat /etc/redhat-release)
+        cs_os_version=$(cat /etc/redhat-release | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+        cs_os_name="rhel"
+    else
+        log_error "Unsupported OS: Could not determine operating system."
+        exit 1
+    fi
+    
+    # Get architecture
+    cs_os_arch=$(uname -m)
+    
+    # Set os_arch_filter for API calls
+    if [ "$cs_os_arch" = "x86_64" ]; then
+        cs_os_arch_filter="+arch:\"x86_64\""
+    elif [ "$cs_os_arch" = "aarch64" ]; then
+        cs_os_arch_filter="+arch:\"aarch64\""
+    else
+        log_warning "Unsupported architecture: $cs_os_arch. Proceeding without architecture filter."
+        cs_os_arch_filter=""
+    fi
+    
+    log_info "Detected OS: $os_name $cs_os_version ($cs_os_arch)"
+}
+
+# Get authentication token for existing CID
+existing_get_oauth_token() {
+    log_info "Getting OAuth token for existing CID..."
+    
+    if [ -n "$EXISTING_FALCON_ACCESS_TOKEN" ]; then
+        log_info "Using existing access token from environment variable."
+        cs_falcon_oauth_token="$EXISTING_FALCON_ACCESS_TOKEN"
+        return 0
+    fi
+    
+    if [ -z "$EXISTING_FALCON_CLIENT_ID" ] || [ -z "$EXISTING_FALCON_CLIENT_SECRET" ]; then
+        log_error "Missing required credentials. EXISTING_FALCON_CLIENT_ID and EXISTING_FALCON_CLIENT_SECRET must be set."
+        exit 1
+    fi
+    
+    if [ -z "$EXISTING_FALCON_CLOUD" ]; then
+        EXISTING_FALCON_CLOUD="us-1"
+        log_warning "EXISTING_FALCON_CLOUD not set, defaulting to us-1"
+    fi
+    
+    # Set cloud-specific API endpoint
+    case "$EXISTING_FALCON_CLOUD" in
+        us-1)
+            cs_cloud="api.crowdstrike.com"
+            ;;
+        us-2)
+            cs_cloud="api.us-2.crowdstrike.com"
+            ;;
+        eu-1)
+            cs_cloud="api.eu-1.crowdstrike.com"
+            ;;
+        us-gov-1)
+            cs_cloud="api.laggar.gcw.crowdstrike.com"
+            ;;
+        *)
+            log_error "Unsupported cloud: $EXISTING_FALCON_CLOUD. Accepted values are ['us-1', 'us-2', 'eu-1', 'us-gov-1']"
+            exit 1
+            ;;
+    esac
+    
+    # Get the token
+    token_response=$(curl_command -s -L -X POST "https://$cs_cloud/oauth2/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "client_id=$EXISTING_FALCON_CLIENT_ID&client_secret=$EXISTING_FALCON_CLIENT_SECRET")
+    
+    if ! handle_curl_error $?; then
+        log_error "Failed to get OAuth token for existing CID."
+        exit 1
+    fi
+    
+    cs_falcon_oauth_token=$(echo "$token_response" | json_value "access_token" | sed 's/"//g')
+    
+    if [ -z "$cs_falcon_oauth_token" ]; then
+        log_error "Failed to get OAuth token: $token_response"
+        exit 1
+    fi
+    
+    log_info "Successfully obtained OAuth token for existing CID."
+}
+
+# Get authentication token for new CID
+new_get_oauth_token() {
+    log_info "Getting OAuth token for new CID..."
+    
+    if [ -n "$NEW_FALCON_ACCESS_TOKEN" ]; then
+        log_info "Using new access token from environment variable."
+        target_cs_falcon_oauth_token="$NEW_FALCON_ACCESS_TOKEN"
+        return 0
+    fi
+    
+    if [ -z "$NEW_FALCON_CLIENT_ID" ] || [ -z "$NEW_FALCON_CLIENT_SECRET" ]; then
+        log_error "Missing required credentials. NEW_FALCON_CLIENT_ID and NEW_FALCON_CLIENT_SECRET must be set."
+        exit 1
+    fi
+    
+    if [ -z "$NEW_FALCON_CLOUD" ]; then
+        NEW_FALCON_CLOUD="us-1"
+        log_warning "NEW_FALCON_CLOUD not set, defaulting to us-1"
+    fi
+    
+    # Set cloud-specific API endpoint
+    case "$NEW_FALCON_CLOUD" in
+        us-1)
+            target_cs_cloud="api.crowdstrike.com"
+            ;;
+        us-2)
+            target_cs_cloud="api.us-2.crowdstrike.com"
+            ;;
+        eu-1)
+            target_cs_cloud="api.eu-1.crowdstrike.com"
+            ;;
+        us-gov-1)
+            target_cs_cloud="api.laggar.gcw.crowdstrike.com"
+            ;;
+        *)
+            log_error "Unsupported cloud: $NEW_FALCON_CLOUD. Accepted values are ['us-1', 'us-2', 'eu-1', 'us-gov-1']"
+            exit 1
+            ;;
+    esac
+    
+    # Get the token
+    token_response=$(curl_command -s -L -X POST "https://$target_cs_cloud/oauth2/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "client_id=$NEW_FALCON_CLIENT_ID&client_secret=$NEW_FALCON_CLIENT_SECRET")
+    
+    if ! handle_curl_error $?; then
+        log_error "Failed to get OAuth token for new CID."
+        exit 1
+    fi
+    
+    target_cs_falcon_oauth_token=$(echo "$token_response" | json_value "access_token" | sed 's/"//g')
+    
+    if [ -z "$target_cs_falcon_oauth_token" ]; then
+        log_error "Failed to get OAuth token: $token_response"
+        exit 1
+    fi
+    
+    log_info "Successfully obtained OAuth token for new CID."
+}
+
+# Basic curl command with user agent
+curl_command() {
+    user_agent="falcon-migration-script/${VERSION}"
+    if [ -n "$USER_AGENT" ]; then
+        user_agent="${user_agent} ${USER_AGENT}"
+    fi
+    
+    curl --silent --show-error --connect-timeout 60 -A "$user_agent" "$@"
+}
+
+# Target curl command (with target token)
+target_curl_command() {
+    if [ -z "$target_cs_falcon_oauth_token" ]; then
+        log_error "Target OAuth token not set. Run new_get_oauth_token first."
+        exit 1
+    fi
+    
+    curl_command -H "Authorization: Bearer $target_cs_falcon_oauth_token" "$@"
+}
+
+# Source curl command (with source token)
+source_curl_command() {
+    if [ -z "$cs_falcon_oauth_token" ]; then
+        log_error "Source OAuth token not set. Run existing_get_oauth_token first."
+        exit 1
+    fi
+    
+    curl_command -H "Authorization: Bearer $cs_falcon_oauth_token" "$@"
+}
+
+# Helper function to parse JSON responses
+json_value() {
+    local key="$1" index="${2:-1}"
+    local js
+    
+    # Read JSON from stdin if available
+    if [ ! -t 0 ]; then
+        js=$(cat)
+    else
+        js="$3"
+    fi
+    
+    # Extract value with jq if available
+    if type jq >/dev/null 2>&1; then
+        echo "$js" | jq -r ".resources[$((index - 1))].$key // empty"
+        return
+    fi
+    
+    # Fallback to awk/sed for basic extraction
+    echo "$js" | grep -o "\"$key\":[^,}]*" | sed -e "s/\"$key\"://" -e 's/^[ \t]*//' | head -n "$index" | tail -n 1
+}
+
+# Get existing tags from the source CID
+get_existing_tags() {
+    log_info "Retrieving existing tags for host with AID: $aid"
+    
+    if [ -z "$aid" ]; then
+        log_warning "Cannot retrieve tags: AID is not available."
+        return 1
+    fi
+    
+    if [ -z "$cs_falcon_oauth_token" ]; then
+        log_warning "Cannot retrieve tags: Source OAuth token is not available."
+        return 1
+    fi
+    
+    # Get host details from API to retrieve tags
+    host_response=$(source_curl_command "https://$cs_cloud/devices/entities/devices/v1?ids=$aid")
+    
+    if ! handle_curl_error $?; then
+        log_warning "Failed to retrieve host details from API."
+        return 1
+    fi
+    
+    # Extract tags from the host response
+    existing_tags=$(echo "$host_response" | grep -o '"tags":\[[^]]*\]' | sed -e 's/"tags"://' -e 's/\[//' -e 's/\]//' -e 's/"//g' -e 's/,/,/g')
+    
+    if [ -n "$existing_tags" ]; then
+        log_info "Retrieved tags: $existing_tags"
+        
+        # Save recovery information
+        save_recovery_info
+        
+        # If we need to combine with NEW_FALCON_TAGS
+        if [ -n "$NEW_FALCON_TAGS" ]; then
+            FALCON_TAGS="${existing_tags},${NEW_FALCON_TAGS}"
+            log_info "Combined tags: $FALCON_TAGS"
+        else
+            FALCON_TAGS="$existing_tags"
+        fi
+    else
+        log_warning "No tags found for host with AID: $aid"
+        if [ -n "$NEW_FALCON_TAGS" ]; then
+            FALCON_TAGS="$NEW_FALCON_TAGS"
+        fi
+    fi
+}
+
+# Get maintenance token for uninstalling sensor
+get_maintenance_token() {
+    log_info "Retrieving maintenance token from API..."
+    
+    if [ -z "$aid" ]; then
+        log_error "Cannot get maintenance token: AID is not available."
+        exit 1
+    fi
+    
+    if [ -z "$cs_falcon_oauth_token" ]; then
+        log_error "Cannot get maintenance token: Source OAuth token is not available."
+        exit 1
+    fi
+    
+    # Call the maintenance token API
+    token_response=$(source_curl_command -X POST "https://$cs_cloud/policy/entities/reveal-uninstall-token/v1" \
+        -H "Content-Type: application/json" \
+        -d "{\"audit_message\":\"Automated uninstall for CID migration\",\"device_id\":\"$aid\"}")
+    
+    if ! handle_curl_error $?; then
+        log_error "Failed to retrieve maintenance token from API."
+        exit 1
+    fi
+    
+    cs_maintenance_token=$(echo "$token_response" | grep -o '"uninstall_token":"[^"]*"' | sed -e 's/"uninstall_token":"//' -e 's/"//')
+    
+    if [ -z "$cs_maintenance_token" ]; then
+        log_error "Failed to extract maintenance token from response: $token_response"
+        exit 1
+    fi
+    
+    log_info "Successfully retrieved maintenance token."
+}
+
+# Get new CID from the target environment
+get_new_falcon_cid() {
+    log_info "Retrieving CID from target environment..."
+    
+    if [ -z "$target_cs_falcon_oauth_token" ]; then
+        log_error "Cannot get CID: Target OAuth token is not available."
+        exit 1
+    fi
+    
+    # Call the sensor-installers API to get CID
+    cid_response=$(target_curl_command "https://$target_cs_cloud/sensors/queries/installers/ccid/v1")
+    
+    if ! handle_curl_error $?; then
+        log_error "Failed to retrieve CID from target environment."
+        exit 1
+    fi
+    
+    cid=$(echo "$cid_response" | grep -o '"resources":\["[^"]*"\]' | sed -e 's/"resources":\["//' -e 's/"\]//')
+    
+    if [ -z "$cid" ]; then
+        log_error "Failed to extract CID from response: $cid_response"
+        exit 1
+    fi
+    
+    log_info "Successfully retrieved CID: $cid"
+    save_recovery_info
+    
+    echo "$cid"
+}
+
+# Get provisioning token from the target environment
+get_new_provisioning_token() {
+    log_info "Checking if provisioning token is required..."
+    
+    # First check if provisioning is required
+    prov_check=$(target_curl_command "https://$target_cs_cloud/sensors/queries/provisioning/v1")
+    
+    if ! handle_curl_error $?; then
+        log_warning "Failed to check provisioning status. Continuing without token."
+        return 1
+    fi
+    
+    is_required=$(echo "$prov_check" | grep -o '"resources":\[[^]]*\]' | grep -o "true")
+    
+    if [ "$is_required" != "true" ]; then
+        log_info "Provisioning token is not required."
+        return 0
+    fi
+    
+    log_info "Provisioning token is required. Generating token..."
+    
+    # Generate a provisioning token
+    token_response=$(target_curl_command -X POST "https://$target_cs_cloud/sensors/entities/provisioning-token/v1" \
+        -H "Content-Type: application/json" \
+        -d "{\"expiration_days\":6,\"label\":\"Migration - $(date +"%Y-%m-%d")\"}")
+    
+    if ! handle_curl_error $?; then
+        log_error "Failed to generate provisioning token."
+        exit 1
+    fi
+    
+    token=$(echo "$token_response" | grep -o '"token":[^,}]*' | sed -e 's/"token"://' -e 's/"//g')
+    
+    if [ -z "$token" ]; then
+        log_error "Failed to extract provisioning token from response: $token_response"
+        exit 1
+    fi
+    
+    log_info "Successfully generated provisioning token."
+    echo "$token"
+}
+
 # Main function to orchestrate the migration process
 main() {
-    echo "Starting Falcon Sensor migration from source CID to target CID..."
+    log_info "Starting Falcon Sensor migration from existing CID to new CID..."
     
     # Initialize variables and settings
     setup_variables
     
     # Check if Falcon sensor is installed
-    echo -n 'Checking if Falcon Sensor is running ... '
+    log_info "Checking if Falcon Sensor is running..."
     cs_sensor_is_running
-    echo '[ Running ]'
+    log_info "Falcon Sensor is running."
     
-    # Get source info before uninstall
-    echo -n 'Getting source sensor information ... '
-    get_source_sensor_info
-    echo '[ Ok ]'
+    # Get existing info before uninstall
+    log_info "Getting existing sensor information..."
+    get_existing_sensor_info
+    log_info "Successfully retrieved sensor information."
+    
+    # Save recovery information before uninstall
+    save_recovery_info
     
     # Uninstall current sensor
-    echo -n 'Uninstalling source Falcon Sensor ... '
-    uninstall_source_sensor
-    echo '[ Ok ]'
+    log_info "Uninstalling existing Falcon Sensor..."
+    uninstall_existing_sensor
+    log_info "Successfully uninstalled Falcon Sensor."
     
-    # Install sensor with target CID
-    echo -n 'Installing Falcon Sensor with target CID ... '
-    install_target_sensor
-    echo '[ Ok ]'
+    # Install sensor with new CID
+    log_info "Installing Falcon Sensor with new CID..."
+    install_new_sensor
+    log_info "Successfully installed Falcon Sensor."
     
     # Register and restart sensor
-    echo -n 'Registering Falcon Sensor ... '
+    log_info "Registering Falcon Sensor..."
     register_sensor
-    echo '[ Ok ]'
+    log_info "Successfully registered Falcon Sensor."
     
-    echo -n 'Restarting Falcon Sensor ... '
+    log_info "Restarting Falcon Sensor..."
     restart_sensor
-    echo '[ Ok ]'
+    log_info "Successfully restarted Falcon Sensor."
     
-    echo "Falcon Sensor successfully migrated to target CID."
+    # Verify installation by checking if sensor is running
+    log_info "Verifying sensor installation..."
+    if pgrep -u root falcon-sensor >/dev/null 2>&1; then
+        log_info "Verification successful: Falcon sensor is running."
+    else
+        log_warning "Verification failed: Falcon sensor is not running after installation."
+        log_warning "Please check the system logs for more information."
+    fi
+    
+    # Clean up recovery file after successful migration
+    if [ -f "$RECOVERY_FILE" ]; then
+        log_info "Migration completed successfully, removing recovery file."
+        rm -f "$RECOVERY_FILE"
+    fi
+    
+    log_info "Falcon Sensor successfully migrated to new CID."
+    log_info "Migration log file: $LOG_FILE"
 }
 
 # Function to check if sensor is running
@@ -166,33 +684,22 @@ get_aid() {
     fi
 }
 
-# Get sensor information from the source CID (including tags)
-get_source_sensor_info() {
-    # Set up the source credentials
-    echo "Setting up source credentials..."
-    source_get_oauth_token
+# Get sensor information from the existing CID (including tags)
+get_existing_sensor_info() {
+    # Set up the existing credentials
+    echo "Setting up existing credentials..."
+    existing_get_oauth_token
     
     # Get existing tags if tag migration is enabled
     if [ "${MIGRATE_TAGS}" = "true" ] && [ -n "$aid" ]; then
         echo "Retrieving existing tags for host with AID: $aid"
-        get_source_tags
+        get_existing_tags
     fi
 }
 
-# Set up source credentials for API access
-setup_source_credentials() {
-    # We need to set proper environment variables for the get_oauth_token function
-    FALCON_CLIENT_ID="$SOURCE_FALCON_CLIENT_ID"
-    FALCON_CLIENT_SECRET="$SOURCE_FALCON_CLIENT_SECRET"
-    FALCON_ACCESS_TOKEN="$SOURCE_FALCON_ACCESS_TOKEN"
-    FALCON_CLOUD="$SOURCE_FALCON_CLOUD"
-    
-    source_get_oauth_token
-}
-
-# Uninstall the source sensor
-uninstall_source_sensor() {
-    # We need source authentication to get maintenance token
+# Uninstall the existing sensor
+uninstall_existing_sensor() {
+    # We need existing authentication to get maintenance token
     if [ -z "$FALCON_MAINTENANCE_TOKEN" ]; then
         echo "No maintenance token provided, retrieving from API..."
         get_maintenance_token
@@ -268,23 +775,23 @@ remove_package() {
     fi
 }
 
-# Install sensor with target CID
-install_target_sensor() {
-    # Switch to target credentials
-    echo "Setting up target credentials..."
-    target_get_oauth_token
+# Install sensor with new CID
+install_new_sensor() {
+    # Switch to new credentials
+    echo "Setting up new credentials..."
+    new_get_oauth_token
     
-    # Get target CID
-    target_cid=$(get_target_falcon_cid)
-    echo "Target CID: $target_cid"
+    # Get new CID
+    new_cid=$(get_new_falcon_cid)
+    echo "New CID: $new_cid"
     
     # Get provisioning token if needed
     if [ -z "$FALCON_PROVISIONING_TOKEN" ]; then
         echo "No provisioning token provided, checking if one is required..."
-        target_provisioning_token=$(get_target_provisioning_token)
-        if [ -n "$target_provisioning_token" ]; then
-            FALCON_PROVISIONING_TOKEN="$target_provisioning_token"
-            echo "Retrieved provisioning token from target CID."
+        new_provisioning_token=$(get_new_provisioning_token)
+        if [ -n "$new_provisioning_token" ]; then
+            FALCON_PROVISIONING_TOKEN="$new_provisioning_token"
+            echo "Retrieved provisioning token from new CID."
         fi
     fi
     
@@ -506,18 +1013,18 @@ EOF
 # Register the sensor
 register_sensor() {
     # Get the falcon cid if not already set
-    if [ -z "$target_cid" ]; then
-        target_cid=$(get_target_falcon_cid)
+    if [ -z "$new_cid" ]; then
+        new_cid=$(get_new_falcon_cid)
     fi
 
     # If cs_falcon_token is not set, try getting it from api
-    if [ -z "$FALCON_PROVISIONING_TOKEN" ] && [ -n "$target_provisioning_token" ]; then
-        FALCON_PROVISIONING_TOKEN="$target_provisioning_token"
+    if [ -z "$FALCON_PROVISIONING_TOKEN" ] && [ -n "$new_provisioning_token" ]; then
+        FALCON_PROVISIONING_TOKEN="$new_provisioning_token"
     fi
 
     # Assemble the registration arguments
     # add the cid to the params
-    cs_falcon_args=--cid="${target_cid}"
+    cs_falcon_args=--cid="${new_cid}"
     if [ -n "${FALCON_PROVISIONING_TOKEN}" ]; then
         cs_token=--provisioning-token="${FALCON_PROVISIONING_TOKEN}"
         cs_falcon_args="$cs_falcon_args $cs_token"
@@ -565,7 +1072,7 @@ register_sensor() {
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_trace"
     fi
 
-    echo "Registering sensor with target CID: $target_cid"
+    echo "Registering sensor with new CID: $new_cid"
     if [ -n "$FALCON_TAGS" ]; then
         echo "Applying tags: $FALCON_TAGS"
     fi
