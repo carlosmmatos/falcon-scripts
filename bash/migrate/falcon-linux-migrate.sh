@@ -153,7 +153,7 @@ migrate_tags="${MIGRATE_TAGS:-true}"
 
 # Use the system's temporary directory
 log_path="${LOG_PATH:-/tmp}"
-recovery_file="$log_path/falcon_migration_recovery.json"
+recovery_file="$log_path/falcon_migration_recovery.csv"
 log_file="$log_path/falcon_migration_$(date +%Y%m%d_%H%M%S).log"
 
 # Create log file
