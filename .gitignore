@@ -8,3 +8,4 @@
 .vagrant
 .vscode
 Vagrantfile
+.lima
