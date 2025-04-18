@@ -30,10 +30,6 @@ Old CID Authentication:
         The cloud region where your old CrowdStrike Falcon instance is hosted.
         Accepted values are ['us-1', 'us-2', 'eu-1', 'us-gov-1'].
 
-    - OLD_FALCON_CID                    (default: unset)
-        Your CrowdStrike Falcon customer ID (CID) for the old CID.
-        If not specified, will be detected automatically via API.
-
 New CID Authentication:
     - NEW_FALCON_CLIENT_ID              (default: unset) [Required]
         Your CrowdStrike Falcon API client ID for the new CID.
@@ -363,11 +359,10 @@ get_provisioning_token() {
 }
 
 get_falcon_cid() {
-    local cid="$1"
-    local cloud="$2"
+    local cloud="$1"
     local
-    if [ -n "$FALCON_CID" ]; then
-        echo "$FALCON_CID"
+    if [ -n "$NEW_FALCON_CID" ]; then
+        echo "$NEW_FALCON_CID"
     else
         cs_target_cid=$(curl_command "https://$(cs_cloud "$cloud")/sensors/queries/installers/ccid/v1")
 
@@ -471,6 +466,7 @@ EOF
 }
 
 cs_sensor_remove() {
+    local cs_maintenance_token="$1"
     remove_package() {
         pkg="$1"
 
@@ -502,11 +498,14 @@ cs_sensor_remove() {
 }
 
 cs_remove_host_from_console() {
+    local aid="$1"
+    local cloud="$2"
+
     if [ -z "$aid" ]; then
         log "WARNING" 'Unable to find AID. Skipping host removal from console.'
     else
         payload="{\"ids\": [\"$aid\"]}"
-        url="https://$(cs_cloud)/devices/entities/devices-actions/v2?action_name=hide_host"
+        url="https://$(cs_cloud "$cloud")/devices/entities/devices-actions/v2?action_name=hide_host"
 
         curl_command -X "POST" -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null
 
@@ -689,6 +688,10 @@ cs_sensor_download() {
 }
 
 get_maintenance_token() {
+    local aid="$1"
+    local cloud="$2"
+    local cs_maintenance_token
+
     if [ -z "$aid" ]; then
         die "Unable to find AID. Cannot retrieve maintenance token."
     fi
@@ -696,7 +699,7 @@ get_maintenance_token() {
     log "INFO" "Retrieving maintenance token from the CrowdStrike Falcon API..."
 
     payload="{\"device_id\": \"$aid\", \"audit_message\": \"CrowdStrike Falcon Uninstall Bash Script\"}"
-    url="https://$(cs_cloud)/policy/combined/reveal-uninstall-token/v1"
+    url="https://$(cs_cloud "$cloud")/policy/combined/reveal-uninstall-token/v1"
 
     response=$(curl_command -X "POST" -H "Content-Type: application/json" -d "$payload" "$url")
 
@@ -710,14 +713,17 @@ get_maintenance_token() {
     else
         die "Failed to retrieve maintenance token. Response: $response"
     fi
+
+    echo "$cs_maintenance_token"
 }
 
 cs_sensor_register() {
+    local cloud="$1"
     # Get the falcon cid
-    cs_falcon_cid="$(get_falcon_cid)"
+    cs_falcon_cid="$(get_falcon_cid "$cloud")"
     # If cs_falcon_token is not set, try getting it from api
     if [ -z "${cs_falcon_token}" ]; then
-        cs_falcon_token="$(get_provisioning_token)"
+        cs_falcon_token="$(get_provisioning_token "$cloud")"
     fi
     # add the cid to the params
     cs_falcon_args=--cid="${cs_falcon_cid}"
@@ -765,146 +771,329 @@ cs_sensor_register() {
     /opt/CrowdStrike/falconctl -s -f ${cs_falcon_args} >/dev/null
 }
 
-install_sensor() {
-    local os_name
-    os_name=$(
-        # returns either: Amazon, Ubuntu, CentOS, RHEL, or SLES
-        # lsb_release is not always present
-        name=$(cat /etc/*release | grep ^NAME= | awk -F'=' '{ print $2 }' | sed "s/\"//g;s/Red Hat.*/RHEL/g;s/ Linux$//g;s/ GNU\/Linux$//g;s/Oracle.*/Oracle/g;s/Amazon.*/Amazon/g")
-        if [ -z "$name" ]; then
-            if lsb_release -s -i | grep -q ^RedHat; then
-                name="RHEL"
-            elif [ -f /usr/bin/lsb_release ]; then
-                name=$(/usr/bin/lsb_release -s -i)
-            fi
-        fi
-        if [ -z "$name" ]; then
-            die "Cannot recognise operating system"
-        fi
+# Create a recovery file to track tags and AID in case migration fails
+create_recovery_file() {
+    local sensor_tags="$1"
+    local falcon_tags="$2"
+    local old_aid="$3"
+    local path="$4"
 
-        echo "$name"
-    )
+    # Create directory if it doesn't exist
+    mkdir -p "$(dirname "$path")"
 
-    local os_version
-    os_version=$(
-        version=$(cat /etc/*release | grep VERSION_ID= | awk '{ print $1 }' | awk -F'=' '{ print $2 }' | sed "s/\"//g")
-        if [ -z "$version" ]; then
-            if type rpm >/dev/null 2>&1; then
-                # older systems may have *release files of different form
-                version=$(rpm -qf /etc/redhat-release --queryformat '%{VERSION}' | sed 's/\([[:digit:]]\+\).*/\1/g')
-            elif [ -f /etc/debian_version ]; then
-                version=$(cat /etc/debian_version)
-            elif [ -f /usr/bin/lsb_release ]; then
-                version=$(/usr/bin/lsb_release -r | /usr/bin/cut -f 2-)
-            fi
-        fi
-        if [ -z "$version" ]; then
-            cat /etc/*release >&2
-            die "Could not determine distribution version"
-        fi
-        echo "$version"
-    )
+    # Write data to recovery file in simple CSV format
+    echo "OldAid,SensorTags,FalconTags" > "$path"
+    echo "$old_aid,$sensor_tags,$falcon_tags" >> "$path"
 
-    local cs_os_name
-    cs_os_name=$(
-        # returns OS name as recognised by CrowdStrike Falcon API
-        # shellcheck disable=SC2221,SC2222
-        case "${os_name}" in
-            Amazon)
-                echo "Amazon Linux"
-                ;;
-            CentOS* | Oracle | RHEL | Rocky | AlmaLinux)
-                echo "*RHEL*"
-                ;;
-            Debian)
-                echo "Debian"
-                ;;
-            SLES)
-                echo "SLES"
-                ;;
-            Ubuntu)
-                echo "Ubuntu"
-                ;;
-            *)
-                die "Unrecognized OS: ${os_name}"
-                ;;
-        esac
-    )
-
-    local cs_os_arch
-    cs_os_arch=$(
-        uname -m
-    )
-
-    local cs_os_arch_filter
-    cs_os_arch_filter=$(
-        case "${cs_os_arch}" in
-            x86_64)
-                echo "+architectures:\"x86_64\""
-                ;;
-            aarch64)
-                echo "+architectures:\"arm64\""
-                ;;
-            s390x)
-                echo "+architectures:\"s390x\""
-                ;;
-            *)
-                die "Unrecognized OS architecture: ${cs_os_arch}"
-                ;;
-        esac
-    )
-
-    local cs_os_version
-    cs_os_version=$(
-        version=$(echo "$os_version" | awk -F'.' '{print $1}')
-        # Check if we are using Amazon Linux 1
-        if [ "${os_name}" = "Amazon" ]; then
-            if [ "$version" != "2" ] && [ "$version" -le 2018 ]; then
-                version="1"
-            fi
-        fi
-        echo "$version"
-    )
-
-    local cs_falcon_token
-    cs_falcon_token=$(
-        if [ -n "$FALCON_PROVISIONING_TOKEN" ]; then
-            echo "$FALCON_PROVISIONING_TOKEN"
-        fi
-    )
-
-    local cs_sensor_policy_name
-    cs_sensor_policy_name=$(
-        if [ -n "$FALCON_SENSOR_UPDATE_POLICY_NAME" ]; then
-            echo "$FALCON_SENSOR_UPDATE_POLICY_NAME"
-        else
-            echo ""
-        fi
-    )
-
-    local cs_falcon_sensor_version_dec
-    cs_falcon_sensor_version_dec=$(
-        re='^[0-9]\+$'
-        if [ -n "$FALCON_SENSOR_VERSION_DECREMENT" ]; then
-            if ! expr "$FALCON_SENSOR_VERSION_DECREMENT" : "$re" >/dev/null 2>&1; then
-                die "The FALCON_SENSOR_VERSION_DECREMENT must be an integer greater than or equal to 0 or less than 5. FALCON_SENSOR_VERSION_DECREMENT: \"$FALCON_SENSOR_VERSION_DECREMENT\""
-            elif [ "$FALCON_SENSOR_VERSION_DECREMENT" -lt 0 ] || [ "$FALCON_SENSOR_VERSION_DECREMENT" -gt 5 ]; then
-                die "The FALCON_SENSOR_VERSION_DECREMENT must be an integer greater than or equal to 0 or less than 5. FALCON_SENSOR_VERSION_DECREMENT: \"$FALCON_SENSOR_VERSION_DECREMENT\""
-            else
-                echo "$FALCON_SENSOR_VERSION_DECREMENT"
-            fi
-        else
-            echo "0"
-        fi
-    )
-
+    log "INFO" "Recovery file created at $path"
 }
 
-uninstall_sensor() {
+# Read data from recovery file
+read_recovery_file() {
+    local path="$1"
 
+    if [ ! -f "$path" ]; then
+        log "WARNING" "Recovery file not found at $path"
+        return 1
+    fi
+
+    # Skip header line and read data
+    old_aid=$(tail -n 1 "$path" | cut -d ',' -f 1)
+    sensor_tags=$(tail -n 1 "$path" | cut -d ',' -f 2)
+    falcon_tags=$(tail -n 1 "$path" | cut -d ',' -f 3)
+
+    log "INFO" "Recovery data loaded: AID=$old_aid"
+    return 0
+}
+
+# Get the host's tags from a specific Falcon instance
+get_falcon_tags() {
+    local base_url="$1"
+    local headers="$2"
+    local aid="$3"
+
+    log "INFO" "Retrieving tags for host with AID: $aid"
+
+    local response
+    response=$(curl_command "https://$base_url/devices/entities/devices/v2?ids=$aid")
+
+    handle_curl_error $?
+
+    if echo "$response" | grep "authorization failed" >/dev/null; then
+        die "Access denied: Please make sure your Falcon API credentials allow access to host data (scope Host [read])"
+    elif echo "$response" | grep "invalid bearer token" >/dev/null; then
+        die "Invalid Access Token: $token"
+    fi
+
+    # Extract tags from response
+    local tags
+    tags=$(echo "$response" | grep -o '"tags":\[[^]]*\]' | sed 's/"tags":\[//;s/\]//')
+
+    # Strip quotes
+    tags=$(echo "$tags" | tr -d '"' | tr ',' ' ')
+
+    echo "$tags"
+}
+
+# Split tags into sensor tags and falcon tags
+split_tags() {
+    local tags="$1"
+    local sensor_tags=""
+    local falcon_tags=""
+    local tag=""
+
+    # Create a temporary file with one tag per line
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "$tags" | tr ' ' '\n' > "$tmpfile"
+
+    while read -r tag; do
+        case "$tag" in
+            SensorGroupingTags/*)
+                # Extract the tag part after SensorGroupingTags/
+                local sensor_tag
+                sensor_tag=$(echo "$tag" | sed 's/^SensorGroupingTags\///')
+                if [ -n "$sensor_tags" ]; then
+                    sensor_tags="$sensor_tags,$sensor_tag"
+                else
+                    sensor_tags="$sensor_tag"
+                fi
+                ;;
+            FalconGroupingTags/*)
+                # Extract the tag part after FalconGroupingTags/
+                local falcon_tag
+                falcon_tag=$(echo "$tag" | sed 's/^FalconGroupingTags\///')
+                if [ -n "$falcon_tags" ]; then
+                    falcon_tags="$falcon_tags,$falcon_tag"
+                else
+                    falcon_tags="$falcon_tag"
+                fi
+                ;;
+        esac
+    done < "$tmpfile"
+
+    rm -f "$tmpfile"
+
+    echo "$sensor_tags;$falcon_tags"
+}
+
+# Set tags for a host in a Falcon instance
+set_falcon_tags() {
+    local base_url="$1"
+    local headers="$2"
+    local aid="$3"
+    local tags="$4"
+
+    log "INFO" "Setting tags for host with AID: $aid"
+
+    # Prepare the tags payload
+    local payload
+    payload=$(cat <<EOF
+{
+    "action": "append",
+    "device_ids": ["$aid"],
+    "tags": [$tags]
+}
+EOF
+    )
+
+    local response
+    response=$(curl_command -X "PATCH" -H "Content-Type: application/json" -d "$payload" "https://$base_url/devices/entities/devices/tags/v1")
+
+    handle_curl_error $?
+
+    if echo "$response" | grep "authorization failed" >/dev/null; then
+        die "Access denied: Please make sure your Falcon API credentials allow access to host data (scope Host [write])"
+    elif echo "$response" | grep "invalid bearer token" >/dev/null; then
+        die "Invalid Access Token: $token"
+    elif echo "$response" | grep "\"updated\":true" >/dev/null; then
+        log "INFO" "Successfully set tags on host"
+        return 0
+    else
+        log "WARNING" "Failed to set tags: $response"
+        return 1
+    fi
+}
+
+# Format tags for API request
+format_tags_for_api() {
+    local tags="$1"
+    local prefix="$2"  # e.g., "FalconGroupingTags" or "SensorGroupingTags"
+    local formatted_tags=""
+
+    # Create a temp file with one tag per line
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "$tags" | tr ',' '\n' > "$tmpfile"
+
+    while read -r tag; do
+        # Skip empty tags
+        if [ -n "$tag" ]; then
+            if [ -n "$formatted_tags" ]; then
+                formatted_tags="$formatted_tags,\"$prefix/$tag\""
+            else
+                formatted_tags="\"$prefix/$tag\""
+            fi
+        fi
+    done < "$tmpfile"
+
+    rm -f "$tmpfile"
+    echo "$formatted_tags"
+}
+
+# Merge tags with new tags, removing duplicates
+merge_tags() {
+    local existing_tags="$1"
+    local new_tags="$2"
+    local merged_tags="$existing_tags"
+
+    # Create a temp file with one tag per line from new_tags
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "$new_tags" | tr ',' '\n' > "$tmpfile"
+
+    while read -r tag; do
+        # Skip empty tags
+        if [ -n "$tag" ]; then
+            # Check if tag exists in merged_tags
+            if ! echo ",$merged_tags," | grep -q ",$tag,"; then
+                if [ -n "$merged_tags" ]; then
+                    merged_tags="$merged_tags,$tag"
+                else
+                    merged_tags="$tag"
+                fi
+            fi
+        fi
+    done < "$tmpfile"
+
+    rm -f "$tmpfile"
+    echo "$merged_tags"
 }
 
 set -e
+
+os_name=$(
+    # returns either: Amazon, Ubuntu, CentOS, RHEL, or SLES
+    # lsb_release is not always present
+    name=$(cat /etc/*release | grep ^NAME= | awk -F'=' '{ print $2 }' | sed "s/\"//g;s/Red Hat.*/RHEL/g;s/ Linux$//g;s/ GNU\/Linux$//g;s/Oracle.*/Oracle/g;s/Amazon.*/Amazon/g")
+    if [ -z "$name" ]; then
+        if lsb_release -s -i | grep -q ^RedHat; then
+            name="RHEL"
+        elif [ -f /usr/bin/lsb_release ]; then
+            name=$(/usr/bin/lsb_release -s -i)
+        fi
+    fi
+    if [ -z "$name" ]; then
+        die "Cannot recognise operating system"
+    fi
+
+    echo "$name"
+)
+
+os_version=$(
+    version=$(cat /etc/*release | grep VERSION_ID= | awk '{ print $1 }' | awk -F'=' '{ print $2 }' | sed "s/\"//g")
+    if [ -z "$version" ]; then
+        if type rpm >/dev/null 2>&1; then
+            # older systems may have *release files of different form
+            version=$(rpm -qf /etc/redhat-release --queryformat '%{VERSION}' | sed 's/\([[:digit:]]\+\).*/\1/g')
+        elif [ -f /etc/debian_version ]; then
+            version=$(cat /etc/debian_version)
+        elif [ -f /usr/bin/lsb_release ]; then
+            version=$(/usr/bin/lsb_release -r | /usr/bin/cut -f 2-)
+        fi
+    fi
+    if [ -z "$version" ]; then
+        cat /etc/*release >&2
+        die "Could not determine distribution version"
+    fi
+    echo "$version"
+)
+
+cs_os_name=$(
+    # returns OS name as recognised by CrowdStrike Falcon API
+    # shellcheck disable=SC2221,SC2222
+    case "${os_name}" in
+        Amazon)
+            echo "Amazon Linux"
+            ;;
+        CentOS* | Oracle | RHEL | Rocky | AlmaLinux)
+            echo "*RHEL*"
+            ;;
+        Debian)
+            echo "Debian"
+            ;;
+        SLES)
+            echo "SLES"
+            ;;
+        Ubuntu)
+            echo "Ubuntu"
+            ;;
+        *)
+            die "Unrecognized OS: ${os_name}"
+            ;;
+    esac
+)
+
+cs_os_arch=$(
+    uname -m
+)
+
+cs_os_arch_filter=$(
+    case "${cs_os_arch}" in
+        x86_64)
+            echo "+architectures:\"x86_64\""
+            ;;
+        aarch64)
+            echo "+architectures:\"arm64\""
+            ;;
+        s390x)
+            echo "+architectures:\"s390x\""
+            ;;
+        *)
+            die "Unrecognized OS architecture: ${cs_os_arch}"
+            ;;
+    esac
+)
+
+cs_os_version=$(
+    version=$(echo "$os_version" | awk -F'.' '{print $1}')
+    # Check if we are using Amazon Linux 1
+    if [ "${os_name}" = "Amazon" ]; then
+        if [ "$version" != "2" ] && [ "$version" -le 2018 ]; then
+            version="1"
+        fi
+    fi
+    echo "$version"
+)
+
+cs_falcon_token=$(
+    if [ -n "$FALCON_PROVISIONING_TOKEN" ]; then
+        echo "$FALCON_PROVISIONING_TOKEN"
+    fi
+)
+
+cs_sensor_policy_name=$(
+    if [ -n "$FALCON_SENSOR_UPDATE_POLICY_NAME" ]; then
+        echo "$FALCON_SENSOR_UPDATE_POLICY_NAME"
+    else
+        echo ""
+    fi
+)
+
+cs_falcon_sensor_version_dec=$(
+    re='^[0-9]\+$'
+    if [ -n "$FALCON_SENSOR_VERSION_DECREMENT" ]; then
+        if ! expr "$FALCON_SENSOR_VERSION_DECREMENT" : "$re" >/dev/null 2>&1; then
+            die "The FALCON_SENSOR_VERSION_DECREMENT must be an integer greater than or equal to 0 or less than 5. FALCON_SENSOR_VERSION_DECREMENT: \"$FALCON_SENSOR_VERSION_DECREMENT\""
+        elif [ "$FALCON_SENSOR_VERSION_DECREMENT" -lt 0 ] || [ "$FALCON_SENSOR_VERSION_DECREMENT" -gt 5 ]; then
+            die "The FALCON_SENSOR_VERSION_DECREMENT must be an integer greater than or equal to 0 or less than 5. FALCON_SENSOR_VERSION_DECREMENT: \"$FALCON_SENSOR_VERSION_DECREMENT\""
+        else
+            echo "$FALCON_SENSOR_VERSION_DECREMENT"
+        fi
+    else
+        echo "0"
+    fi
+)
 
 # shellcheck disable=SC2001
 proxy=$(
@@ -1000,3 +1189,178 @@ if [ -n "$FALCON_TRACE" ]; then
         esac
     )
 fi
+
+# Main migration function
+main() {
+    log "INFO" "Starting Falcon sensor migration from old CID to new CID"
+
+    # Check if we are in recovery mode
+    local recovery_mode=false
+    if [ -f "$recovery_file" ]; then
+        recovery_mode=true
+        log "INFO" "Recovery file detected. Attempting to recover from previous migration attempt."
+        if read_recovery_file "$recovery_file"; then
+            log "INFO" "Loaded recovery data: old_aid=$old_aid"
+        else
+            log "WARNING" "Failed to load recovery data. Starting fresh migration."
+            recovery_mode=false
+        fi
+    fi
+
+    # Get the AID if not in recovery mode
+    local cs_falcon_oauth_token
+    if [ "$recovery_mode" = false ]; then
+        # Get the AID and tags
+        old_aid=$(get_aid)
+
+        if [ -z "$old_aid" ]; then
+            log "WARNING" "No AID found. The sensor may not be properly installed."
+        else
+            log "INFO" "Found AID: $old_aid"
+
+            if [ "$migrate_tags" = "true" ]; then
+                log "INFO" "Retrieving existing tags from current installation..."
+
+                # Authenticate with the old CID
+                cs_falcon_oauth_token=""
+                cs_falcon_oauth_token=$(get_oauth_token "$OLD_FALCON_CLIENT_ID" "$OLD_FALCON_CLIENT_SECRET" "$old_cs_falcon_cloud")
+
+                # Get the tags
+                local tags
+                tags=$(get_falcon_tags "$(cs_cloud "$old_cs_falcon_cloud")" "$cs_falcon_oauth_token" "$old_aid")
+
+                # Split tags into sensor and falcon grouping tags
+                local split_result
+                split_result=$(split_tags "$tags")
+
+                # Parse split result (semicolon-separated)
+                sensor_tags=$(echo "$split_result" | cut -d ';' -f 1)
+                falcon_tags=$(echo "$split_result" | cut -d ';' -f 2)
+
+                log "INFO" "Found sensor tags: $sensor_tags"
+                log "INFO" "Found falcon tags: $falcon_tags"
+
+                # Create recovery file
+                create_recovery_file "$sensor_tags" "$falcon_tags" "$old_aid" "$recovery_file"
+            fi
+        fi
+    fi
+
+    # Uninstall old sensor
+    log "INFO" "Uninstalling old Falcon sensor..."
+
+    # Set auth token for old CID (if needed)
+    if [ -z "$cs_falcon_oauth_token" ]; then
+        cs_falcon_oauth_token=$(get_oauth_token "$OLD_FALCON_CLIENT_ID" "$OLD_FALCON_CLIENT_SECRET" "$old_cs_falcon_cloud")
+    fi
+
+    # Get maintenance token if needed
+    local cs_maintenance_token=""
+    if [ -z "$FALCON_MAINTENANCE_TOKEN" ] && [ -n "$old_aid" ]; then
+        cs_maintenance_token=$(get_maintenance_token "$old_aid" "$old_cs_falcon_cloud")
+    fi
+
+    # Perform uninstall
+    cs_sensor_remove "$cs_maintenance_token"
+
+    # Remove host from old console if requested
+    if [ "${FALCON_REMOVE_HOST}" = "true" ] && [ -n "$old_aid" ]; then
+        log "INFO" "Removing host from old Falcon CID console..."
+        cs_remove_host_from_console "$old_aid" "$old_cs_falcon_cloud"
+    fi
+
+    # Install new sensor
+    log "INFO" "Installing Falcon sensor to new CID..."
+
+    # Set auth token for new CID
+    cs_falcon_oauth_token=$(get_oauth_token "$NEW_FALCON_CLIENT_ID" "$NEW_FALCON_CLIENT_SECRET" "$new_cs_falcon_cloud")
+
+    # Install the sensor
+    cs_sensor_install
+
+    # Register the sensor
+    if [ -z "$FALCON_INSTALL_ONLY" ] || [ "${FALCON_INSTALL_ONLY}" = "false" ]; then
+        log "INFO" "Registering Falcon sensor..."
+
+        # Handle tags if migrating
+        if [ "$migrate_tags" = "true" ]; then
+            # Merge existing sensor tags with any new tags specified
+            if [ -n "$FALCON_TAGS" ]; then
+                sensor_tags=$(merge_tags "$sensor_tags" "$FALCON_TAGS")
+                log "INFO" "Merged sensor tags: $sensor_tags"
+            fi
+
+            # Set the tags for the sensor install
+            FALCON_TAGS="$sensor_tags"
+        fi
+
+        cs_sensor_register "$new_cs_falcon_cloud"
+        cs_sensor_restart
+    fi
+
+    # Set Falcon grouping tags if migrating tags and falcon tags exist
+    if [ "$migrate_tags" = "true" ] && [ -n "$falcon_tags" ]; then
+        log "INFO" "Waiting for new sensor registration before setting Falcon grouping tags..."
+
+        # Wait for the new AID to be available
+        local max_wait=60
+        local wait_count=0
+        local new_aid=""
+
+        while [ $wait_count -lt $max_wait ]; do
+            new_aid=$(get_aid)
+            if [ -n "$new_aid" ]; then
+                break
+            fi
+            log "INFO" "Waiting for new AID to be available... ($wait_count/$max_wait)"
+            wait_count=$((wait_count + 1))
+            sleep 5
+        done
+
+        if [ -n "$new_aid" ]; then
+            log "INFO" "New AID obtained: $new_aid"
+
+            # Merge existing falcon tags with any new falcon tags specified
+            if [ -n "$FALCON_GROUPING_TAGS" ]; then
+                falcon_tags=$(merge_tags "$falcon_tags" "$FALCON_GROUPING_TAGS")
+                log "INFO" "Merged Falcon grouping tags: $falcon_tags"
+            fi
+
+            # Format tags for API request
+            local formatted_tags
+            formatted_tags=$(format_tags_for_api "$falcon_tags" "FalconGroupingTags")
+
+            # Set falcon tags via API
+            log "INFO" "Setting Falcon grouping tags via API..."
+            local max_attempts=5
+            local attempt=1
+            local success=false
+
+            while [ $attempt -le $max_attempts ] && [ "$success" = false ]; do
+                if set_falcon_tags "$(cs_cloud "$new_cs_falcon_cloud")" "$cs_falcon_oauth_token" "$new_aid" "$formatted_tags"; then
+                    success=true
+                else
+                    log "WARNING" "Failed to set Falcon tags, attempt $attempt of $max_attempts"
+                    attempt=$((attempt + 1))
+                    sleep 5
+                fi
+            done
+
+            if [ "$success" = true ]; then
+                log "INFO" "Successfully set Falcon grouping tags"
+            else
+                log "WARNING" "Failed to set Falcon grouping tags after $max_attempts attempts"
+            fi
+        else
+            log "WARNING" "Could not obtain new AID after $max_wait attempts"
+        fi
+    fi
+
+    # Remove recovery file when done
+    if [ -f "$recovery_file" ]; then
+        log "INFO" "Removing recovery file..."
+        rm -f "$recovery_file"
+    fi
+
+    log "INFO" "Falcon sensor migration completed successfully"
+}
