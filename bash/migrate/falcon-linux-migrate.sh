@@ -123,6 +123,12 @@ This script recognizes the following argument:
 EOF
 }
 
+# Error handling function - defined first so it can be used anywhere in the script
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
 # If -h or --help is passed, print the usage and exit
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     print_usage
@@ -134,12 +140,6 @@ if [ "$(id -u)" -ne 0 ]; then
     die "This script must be ran as root or with sudo."
 fi
 
-# Error handling function
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
 json_value() {
     KEY=$1
     num=$2
@@ -150,6 +150,8 @@ json_value() {
 old_cs_falcon_cloud="${OLD_FALCON_CLOUD:-us-1}"
 new_cs_falcon_cloud="${NEW_FALCON_CLOUD:-us-1}"
 migrate_tags="${MIGRATE_TAGS:-true}"
+# Define cs_falcon_oauth_token as a global variable
+cs_falcon_oauth_token=""
 
 # Use the system's temporary directory
 log_path="${LOG_PATH:-/tmp}"
@@ -360,7 +362,6 @@ get_provisioning_token() {
 
 get_falcon_cid() {
     local cloud="$1"
-    local
     if [ -n "$NEW_FALCON_CID" ]; then
         echo "$NEW_FALCON_CID"
     else
@@ -522,7 +523,7 @@ cs_sensor_installed() {
         log "WARNING" "Falcon sensor is already uninstalled." && exit 0
     fi
     # Get AID if FALCON_REMOVE_HOST is set to true or if we need to get a maintenance token
-    if [ "${FALCON_REMOVE_HOST}" = "true" ] || [ -n "$FALCON_CLIENT_ID" ] && [ -n "$FALCON_CLIENT_SECRET" ] && [ -z "$FALCON_MAINTENANCE_TOKEN" ]; then
+    if [ "${FALCON_REMOVE_HOST}" = "true" ] || [ -n "$OLD_FALCON_CLIENT_ID" ] && [ -n "$OLD_FALCON_CLIENT_SECRET" ] && [ -z "$FALCON_MAINTENANCE_TOKEN" ]; then
         get_aid
     fi
 }
@@ -601,10 +602,10 @@ os_install_package() {
 }
 
 cs_sensor_policy_version() {
-    local cs_policy_name="$1" sensor_update_policy sensor_update_versions
+    local cs_policy_name="$1" sensor_update_policy sensor_update_versions cloud="$new_cs_falcon_cloud"
 
     sensor_update_policy=$(
-        curl_command -G "https://$(cs_cloud)/policy/combined/sensor-update/v2" \
+        curl_command -G "https://$(cs_cloud "$cloud")/policy/combined/sensor-update/v2" \
             --data-urlencode "filter=platform_name:\"Linux\"+name.raw:\"$cs_policy_name\""
     )
 
@@ -638,7 +639,7 @@ cs_sensor_policy_version() {
 }
 
 cs_sensor_download() {
-    local destination_dir="$1" existing_installers sha_list INDEX sha file_type installer
+    local destination_dir="$1" existing_installers sha_list INDEX sha file_type installer cloud="$new_cs_falcon_cloud"
 
     if [ -n "$cs_sensor_policy_name" ]; then
         cs_sensor_version=$(cs_sensor_policy_version "$cs_sensor_policy_name")
@@ -651,7 +652,7 @@ cs_sensor_download() {
     fi
 
     existing_installers=$(
-        curl_command -G "https://$(cs_cloud)/sensors/combined/installers/v2?sort=version|desc" \
+        curl_command -G "https://$(cs_cloud "$cloud")/sensors/combined/installers/v2?sort=version|desc" \
             --data-urlencode "filter=os:\"$cs_os_name\"+os_version:\"*$cs_os_version*\"$cs_api_version_filter$cs_os_arch_filter"
     )
 
@@ -680,7 +681,7 @@ cs_sensor_download() {
 
     installer="${destination_dir}/falcon-sensor.${file_type}"
 
-    curl_command "https://$(cs_cloud)/sensors/entities/download-installer/v1?id=$sha" -o "${installer}"
+    curl_command "https://$(cs_cloud "$cloud")/sensors/entities/download-installer/v1?id=$sha" -o "${installer}"
 
     handle_curl_error $?
 
@@ -1193,6 +1194,11 @@ fi
 # Main migration function
 main() {
     log "INFO" "Starting Falcon sensor migration from old CID to new CID"
+    
+    # Validate required environment variables
+    if [ -z "$OLD_FALCON_CLIENT_ID" ] || [ -z "$OLD_FALCON_CLIENT_SECRET" ] || [ -z "$NEW_FALCON_CLIENT_ID" ] || [ -z "$NEW_FALCON_CLIENT_SECRET" ]; then
+        die "Required environment variables are not set. Please ensure OLD_FALCON_CLIENT_ID, OLD_FALCON_CLIENT_SECRET, NEW_FALCON_CLIENT_ID, and NEW_FALCON_CLIENT_SECRET are all set."
+    fi
 
     # Check if we are in recovery mode
     local recovery_mode=false
@@ -1208,7 +1214,6 @@ main() {
     fi
 
     # Get the AID if not in recovery mode
-    local cs_falcon_oauth_token
     if [ "$recovery_mode" = false ]; then
         # Get the AID and tags
         old_aid=$(get_aid)
@@ -1364,3 +1369,5 @@ main() {
 
     log "INFO" "Falcon sensor migration completed successfully"
 }
+
+main "$@"
