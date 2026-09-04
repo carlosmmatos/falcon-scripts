@@ -8,8 +8,8 @@
 #
 # This test loads curl_command() from the shipped script, replaces curl with a
 # stub that records its argument vector, and checks that the token is never
-# handed to curl as an argument. The token is supplied through curl's
-# credential-aware OAuth configuration on stdin.
+# handed to curl as an argument. The token always travels on curl's
+# configuration input, in both credential mechanisms that the script supports.
 #
 # Usage: sh test-curl-command.sh [path-to-falcon-container-sensor-pull.sh]
 
@@ -102,7 +102,8 @@ assert_token_not_in_arguments() {
 }
 
 assert_file_contains() {
-    if grep -qF "$2" "$3"; then
+    # Use -- so that a pattern starting with a dash is not read as an option.
+    if grep -qF -- "$2" "$3"; then
         pass "$1"
     else
         fail "$1"
@@ -114,15 +115,35 @@ assert_url_passed_through() {
     assert_file_contains "$1: request URL reached curl" "$URL" "$ARGV_FILE"
 }
 
-# Credential-aware OAuth configuration prevents forwarding the token when a
-# redirect crosses to another host.
-echo "case: OAuth credential over stdin (-K-)"
-curl_command "$TOKEN" "$URL"
-assert_token_not_in_arguments "OAuth config"
-assert_url_passed_through "OAuth config"
-assert_file_contains "OAuth config: token delivered over stdin" \
-    "oauth2-bearer = \"$TOKEN\"" "$STDIN_FILE"
+# curl_command() picks its credential mechanism from curl_has_oauth2_bearer.
+# Mode 1 uses the oauth2-bearer configuration key, which curl 7.33.0 added.
+# Mode 0 is the fallback for older curl and sends a raw Authorization header.
+# Both must keep the token on stdin and off the argument vector.
+for mode in 1 0; do
+    # shellcheck disable=SC2034  # read by the curl_command body loaded with eval
+    curl_has_oauth2_bearer=$mode
+    if [ "$mode" -eq 1 ]; then
+        label="oauth2-bearer config"
+        expected="oauth2-bearer = \"$TOKEN\""
+    else
+        label="raw header fallback"
+        expected="header = \"Authorization: Bearer $TOKEN\""
+    fi
 
-echo
+    echo "case: $label (curl_has_oauth2_bearer=$mode)"
+    curl_command "$TOKEN" "$URL"
+    assert_token_not_in_arguments "$label"
+    assert_url_passed_through "$label"
+    assert_file_contains "$label: token delivered over stdin" \
+        "$expected" "$STDIN_FILE"
+    assert_file_contains "$label: curl reads the configuration from stdin" \
+        "-K-" "$ARGV_FILE"
+    assert_file_contains "$label: request protocol restricted" \
+        "--proto" "$ARGV_FILE"
+    assert_file_contains "$label: redirect protocol restricted" \
+        "--proto-redir" "$ARGV_FILE"
+    echo
+done
+
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

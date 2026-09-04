@@ -50,9 +50,9 @@ CrowdStrike now provides unified images that work across all regions:
 
 ## Security recommendations
 
-### Use cURL version 7.55.0 or later
+### Use cURL version 7.33.0 or later
 
-OAuth credentials are supplied to cURL through its configuration input rather than command-line arguments. This also lets cURL treat the bearer token as an authentication credential and prevents it from forwarding the token when a redirect crosses to another host. **We recommend upgrading cURL to version 7.55.0 or later.** If this is not possible, `--allow-legacy-curl` bypasses the version check without reverting to command-line credential handling.
+OAuth credentials go to cURL through its configuration input instead of command-line arguments, so the credential never appears in the process list. cURL 7.33.0 and later accept the credential as an OAuth 2 bearer token, which also lets cURL remove the credential when a redirect crosses to another host. On older cURL the script can send the same credential as a raw `Authorization` header — still through the configuration input, still off the command line — but it cannot confirm the redirect behavior of a cURL that old. The script restricts every request and redirect to HTTPS. To accept this and continue on an older cURL, use `--allow-legacy-curl`.
 
 To check your version of cURL, run the following command: `curl --version`
 

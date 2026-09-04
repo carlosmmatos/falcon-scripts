@@ -98,7 +98,7 @@ Other Options
         The path to download the falcon sensor to.
 
     - ALLOW_LEGACY_CURL                 (default: false)
-        To use the legacy version of curl; version < 7.55.0.
+        To continue on a version of curl older than 7.33.0.
 
     - GET_ACCESS_TOKEN                  (default: false)
         Prints an access token and exits.
@@ -551,10 +551,12 @@ EOF
             -d "$request_data"
     )
     handle_curl_error $?
-    if ! echo "$response" | grep -q '^.*"InvalidParameters":\[\].*$'; then
-        die "Unexpected response from AWS SSM Parameter Store: $response"
-    elif ! echo "$response" | grep -q '^.*'"${param_name}"'.*$'; then
-        die "Unexpected response from AWS SSM Parameter Store: $response"
+    if ! echo "$response" | grep -q '^.*"InvalidParameters":\[\].*$' ||
+        ! echo "$response" | grep -q '^.*'"${param_name}"'.*$'; then
+        # The response body holds the decrypted parameter value, so report only
+        # the error message that AWS returns and never the body itself.
+        ssm_error=$(echo "$response" | json_value "message" 1)
+        die "Unexpected response from AWS SSM Parameter Store for parameter '$param_name'.${ssm_error:+ AWS reported:$ssm_error}"
     fi
     echo "$response"
 }
@@ -644,31 +646,39 @@ cs_cloud() {
     esac
 }
 
-# Check if curl is greater or equal to 7.55
-old_curl=$(
-    if ! command -v curl >/dev/null 2>&1; then
-        die "The 'curl' command is missing. Please install it before continuing. Aborting..."
-    fi
+if ! command -v curl >/dev/null 2>&1; then
+    die "The 'curl' command is missing. Please install it before continuing. Aborting..."
+fi
 
+# curl 7.33.0 added the oauth2-bearer option. Older versions ignore the option
+# without an error, which sends the request with no credential at all.
+curl_has_oauth2_bearer=$(
     version=$(curl --version | head -n 1 | awk '{ print $2 }')
-    minimum="7.55"
+    minimum="7.33"
 
-    # Check if the version is less than the minimum
-    if printf "%s\n" "$version" "$minimum" | sort -V -C; then
-        echo 0
-    else
+    # sort -C succeeds when the input is already in order, so print the minimum
+    # first. The check then also accepts a version equal to the minimum.
+    if printf "%s\n" "$minimum" "$version" | sort -V -C; then
         echo 1
+    else
+        echo 0
     fi
 )
 
-# Old curl print warning message
-if [ "$old_curl" -eq 0 ]; then
-    if [ "${ALLOW_LEGACY_CURL}" != "true" ]; then
+if [ "$curl_has_oauth2_bearer" -eq 0 ]; then
+    if [ "${ALLOW_LEGACY_CURL:-false}" != "true" ]; then
         echo """
-WARNING: Your version of curl is below the supported 7.55.0 baseline.
-OAuth credentials remain protected from command-line exposure in compatibility mode.
+WARNING: Your version of curl is older than 7.33.0 and cannot use the
+oauth2-bearer option. The script can instead send the credential as a raw
+Authorization header. The credential still travels on the curl configuration
+input and stays off the command line either way.
 
-To bypass this warning, set the environment variable ALLOW_LEGACY_CURL=true
+What is not verified on curl this old is redirect handling: the script cannot
+confirm that your curl removes the credential when a redirect crosses to
+another host. The script restricts every request and redirect to HTTPS, so the
+credential can only ever go to an HTTPS host.
+
+To accept this and continue, set the environment variable ALLOW_LEGACY_CURL=true
 """
         exit 1
     fi
@@ -709,7 +719,13 @@ handle_curl_error() {
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    printf 'oauth2-bearer = "%s"\n' "$cs_falcon_oauth_token" |
+    local auth_config
+    if [ "$curl_has_oauth2_bearer" -eq 1 ]; then
+        auth_config=$(printf 'oauth2-bearer = "%s"' "$cs_falcon_oauth_token")
+    else
+        auth_config=$(printf 'header = "Authorization: Bearer %s"' "$cs_falcon_oauth_token")
+    fi
+    printf '%s\n' "$auth_config" |
         curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 

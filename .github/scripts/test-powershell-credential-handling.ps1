@@ -53,7 +53,12 @@ foreach ($RelativePath in $Scripts) {
 }
 
 if ($Failures.Count -gt 0) {
-    $Failures | ForEach-Object { Write-Error $_ }
+    # -ErrorAction Continue overrides $ErrorActionPreference = 'Stop' for these
+    # calls. Without it the first Write-Error throws, and only one of the
+    # collected failures is ever reported.
+    foreach ($Failure in $Failures) {
+        Write-Error $Failure -ErrorAction Continue
+    }
     exit 1
 }
 
