@@ -1,5 +1,21 @@
 #!/bin/bash
 
+case $- in
+    *x*)
+        set +x
+        printf '%s\n' 'WARNING: shell tracing disabled to protect credentials.' >&2
+        ;;
+esac
+
+falcon_client_secret=$FALCON_CLIENT_SECRET
+falcon_access_token=$FALCON_ACCESS_TOKEN
+falcon_provisioning_token=$FALCON_PROVISIONING_TOKEN
+unset FALCON_CLIENT_SECRET FALCON_ACCESS_TOKEN FALCON_PROVISIONING_TOKEN
+FALCON_CLIENT_SECRET=$falcon_client_secret
+FALCON_ACCESS_TOKEN=$falcon_access_token
+FALCON_PROVISIONING_TOKEN=$falcon_provisioning_token
+unset falcon_client_secret falcon_access_token falcon_provisioning_token
+
 print_usage() {
     cat <<EOF
 
@@ -305,7 +321,7 @@ cs_sensor_policy_version() {
     if echo "$sensor_update_policy" | grep "authorization failed"; then
         die "Access denied: Please make sure that your Falcon API credentials allow access to sensor update policies (scope Sensor update policies [read])"
     elif echo "$sensor_update_policy" | grep "invalid bearer token"; then
-        die "Invalid Access Token: $cs_falcon_oauth_token"
+        die "Invalid or expired Falcon access token."
     fi
 
     sensor_update_versions=$(echo "$sensor_update_policy" | json_value "sensor_version")
@@ -327,6 +343,20 @@ cs_sensor_policy_version() {
         echo "$1"
     fi
     IFS=$oldIFS
+}
+
+verify_sha256() {
+    local file="$1" expected_sha="$2" local_sha
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        local_sha=$(sha256sum "$file" | awk '{ print $1 }')
+    else
+        local_sha=$(openssl dgst -sha256 "$file" | awk '{ print $NF }')
+    fi
+    if [ "$local_sha" != "$expected_sha" ]; then
+        rm -f "$file"
+        die "Downloaded sensor installer failed SHA-256 verification."
+    fi
 }
 
 cs_sensor_download() {
@@ -352,7 +382,7 @@ cs_sensor_download() {
     if echo "$existing_installers" | grep "authorization failed"; then
         die "Access denied: Please make sure that your Falcon API credentials allow sensor download (scope Sensor Download [read])"
     elif echo "$existing_installers" | grep "invalid bearer token"; then
-        die "Invalid Access Token: $cs_falcon_oauth_token"
+        die "Invalid or expired Falcon access token."
     fi
 
     sha_list=$(echo "$existing_installers" | json_value "sha256")
@@ -375,6 +405,8 @@ cs_sensor_download() {
     curl_command "https://$(cs_cloud)/sensors/entities/download-installer/v3?id=$sha" -o "${installer}"
 
     handle_curl_error $?
+
+    verify_sha256 "$installer" "$sha"
 
     echo "$installer"
 }
@@ -467,9 +499,9 @@ aws_ssm_parameter() {
 
     token=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
     api_endpoint="AmazonSSM.GetParameters"
-    iam_role="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
-    aws_my_region="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/placement/availability-zone | sed s/.$//)"
-    _security_credentials="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")"
+    iam_role="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
+    aws_my_region="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/placement/availability-zone | sed s/.$//)"
+    _security_credentials="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")"
     access_key_id="$(echo "$_security_credentials" | grep AccessKeyId | sed -e 's/  "AccessKeyId" : "//' -e 's/",$//')"
     access_key_secret="$(echo "$_security_credentials" | grep SecretAccessKey | sed -e 's/  "SecretAccessKey" : "//' -e 's/",$//')"
     security_token="$(echo "$_security_credentials" | grep Token | sed -e 's/  "Token" : "//' -e 's/",$//')"
@@ -507,17 +539,16 @@ EOF
     )
 
     response=$(
-        curl -s "https://ssm.$aws_my_region.amazonaws.com/" \
-            -x "$proxy" \
-            -H "Authorization: AWS4-HMAC-SHA256 \
-            Credential=$access_key_id/$date/$aws_my_region/ssm/aws4_request, \
-            SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target, \
-            Signature=$signature" \
-            -H "x-amz-security-token: $security_token" \
-            -H "x-amz-target: $api_endpoint" \
-            -H "content-type: application/x-amz-json-1.1" \
-            -d "$request_data" \
-            -H "x-amz-date: $datetime"
+        {
+            printf 'header = "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s/%s/ssm/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target, Signature=%s"\n' \
+                "$access_key_id" "$date" "$aws_my_region" "$signature"
+            printf 'header = "x-amz-security-token: %s"\n' "$security_token"
+            printf 'header = "x-amz-target: %s"\n' "$api_endpoint"
+            printf 'header = "content-type: application/x-amz-json-1.1"\n'
+            printf 'header = "x-amz-date: %s"\n' "$datetime"
+        } | curl -s "https://ssm.$aws_my_region.amazonaws.com/" \
+            -x "$proxy" -K- \
+            -d "$request_data"
     )
     handle_curl_error $?
     if ! echo "$response" | grep -q '^.*"InvalidParameters":\[\].*$'; then
@@ -634,8 +665,8 @@ old_curl=$(
 if [ "$old_curl" -eq 0 ]; then
     if [ "${ALLOW_LEGACY_CURL}" != "true" ]; then
         echo """
-WARNING: Your version of curl does not support the ability to pass headers via stdin.
-For security considerations, we strongly recommend upgrading to curl 7.55.0 or newer.
+WARNING: Your version of curl is below the supported 7.55.0 baseline.
+OAuth credentials remain protected from command-line exposure in compatibility mode.
 
 To bypass this warning, set the environment variable ALLOW_LEGACY_CURL=true
 """
@@ -678,13 +709,8 @@ handle_curl_error() {
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    set -- "$@"
-
-    if [ "$old_curl" -eq 0 ]; then
-        curl -s -x "$proxy" -L -H "Authorization: Bearer ${cs_falcon_oauth_token}" "$@"
-    else
-        echo "Authorization: Bearer ${cs_falcon_oauth_token}" | curl -s -x "$proxy" -L -H @- "$@"
-    fi
+    printf 'oauth2-bearer = "%s"\n' "$cs_falcon_oauth_token" |
+        curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 
 check_aws_instance() {

@@ -115,6 +115,8 @@ param(
     [string] $UserAgent
 )
 begin {
+    Set-PSDebug -Off
+
 
     if ($FalconAccessToken) {
         if ($FalconCloud -eq "autodiscover") {
@@ -200,7 +202,6 @@ begin {
             try {
                 $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body
                 $content = ConvertFrom-Json -InputObject $response.Content
-                Write-VerboseLog -VerboseInput $content -PreMessage 'Invoke-FalconAuth - $content:'
 
                 if ([string]::IsNullOrEmpty($content.access_token)) {
                     $Message = 'Unable to authenticate to the CrowdStrike Falcon API. Please check your credentials and try again.'
@@ -529,7 +530,6 @@ process {
             try {
                 $response = Invoke-WebRequest @WebRequestParams -Uri $url -UseBasicParsing -Method 'POST' -Body $bodyJson -MaximumRedirection 0
                 $content = ConvertFrom-Json -InputObject $response.Content
-                Write-VerboseLog -VerboseInput $content -PreMessage 'GetToken - $content:'
 
                 if ($content.errors) {
                     $Message = 'Failed to retrieve maintenance token: '
@@ -539,7 +539,7 @@ process {
                 }
                 else {
                     $MaintenanceToken = $content.resources[0].uninstall_token
-                    Write-FalconLog 'GetToken' "Retrieved maintenance token: $MaintenanceToken"
+                    Write-FalconLog 'GetToken' 'Retrieved maintenance token'
                     $UninstallParams += " MAINTENANCE_TOKEN=$MaintenanceToken"
                 }
             }
@@ -576,9 +576,8 @@ process {
     if ($UninstallTool -eq 'standalone') {
         # Check if /uninstall parameter is present
         if ($UninstallParams -match '/?uninstall') {
-            $OriginalParams = $UninstallParams
             $UninstallParams = $UninstallParams -replace '/?uninstall\s*', '' -replace '^\s+|\s+$', ''
-            Write-FalconLog 'ParamValidation' "Removed '/uninstall' parameter for standalone uninstaller. Original: '$OriginalParams', Modified: '$UninstallParams'"
+            Write-FalconLog 'ParamValidation' "Removed '/uninstall' parameter for standalone uninstaller; parameter values omitted from the log"
         }
 
         # Ensure we have at least /quiet parameter
@@ -590,7 +589,7 @@ process {
 
     # Begin uninstallation
     Write-FalconLog 'Uninstaller' 'Uninstalling the Falcon Sensor...'
-    Write-FalconLog 'StartProcess' "Starting uninstaller with parameters: '$UninstallParams'"
+    Write-FalconLog 'StartProcess' 'Starting uninstaller; command-line parameters omitted from the log because they may contain sensitive values'
     $UninstallerProcess = Start-Process -FilePath "$UninstallerPath" -ArgumentList $UninstallParams -PassThru -Wait
     $UninstallerProcessId = $UninstallerProcess.Id
     Write-FalconLog 'StartProcess' "Started '$UninstallerPath' ($UninstallerProcessId)"

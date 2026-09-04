@@ -1,5 +1,21 @@
 #!/bin/bash
 
+case $- in
+    *x*)
+        set +x
+        printf '%s\n' 'WARNING: shell tracing disabled to protect credentials.' >&2
+        ;;
+esac
+
+falcon_client_secret=$FALCON_CLIENT_SECRET
+falcon_access_token=$FALCON_ACCESS_TOKEN
+falcon_maintenance_token=$FALCON_MAINTENANCE_TOKEN
+unset FALCON_CLIENT_SECRET FALCON_ACCESS_TOKEN FALCON_MAINTENANCE_TOKEN
+FALCON_CLIENT_SECRET=$falcon_client_secret
+FALCON_ACCESS_TOKEN=$falcon_access_token
+FALCON_MAINTENANCE_TOKEN=$falcon_maintenance_token
+unset falcon_client_secret falcon_access_token falcon_maintenance_token
+
 print_usage() {
     cat <<EOF
 
@@ -223,35 +239,18 @@ get_maintenance_token() {
             die "Retrieved empty maintenance token from API."
         fi
     else
-        die "Failed to retrieve maintenance token. Response: $response"
+        die "Failed to retrieve a maintenance token from the Falcon API."
     fi
 }
 
-old_curl=$(
-    if ! command -v curl >/dev/null 2>&1; then
-        die "The 'curl' command is missing. Please install it before continuing. Aborting..."
-    fi
-
-    version=$(curl --version | head -n 1 | awk '{ print $2 }')
-    minimum="7.55"
-
-    # Check if the version is less than the minimum
-    if printf "%s\n" "$version" "$minimum" | sort -V -C; then
-        echo 0
-    else
-        echo 1
-    fi
-)
+if ! command -v curl >/dev/null 2>&1; then
+    die "The 'curl' command is missing. Please install it before continuing. Aborting..."
+fi
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    set -- "$@"
-
-    if [ "$old_curl" -eq 0 ]; then
-        curl -s -x "$proxy" -L -H "Authorization: Bearer ${cs_falcon_oauth_token}" "$@"
-    else
-        echo "Authorization: Bearer ${cs_falcon_oauth_token}" | curl -s -x "$proxy" -L -H @- "$@"
-    fi
+    printf 'oauth2-bearer = "%s"\n' "$cs_falcon_oauth_token" |
+        curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 
 handle_curl_error() {
@@ -299,9 +298,9 @@ aws_ssm_parameter() {
 
     token=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
     api_endpoint="AmazonSSM.GetParameters"
-    iam_role="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
-    aws_my_region="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/placement/availability-zone | sed s/.$//)"
-    _security_credentials="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")"
+    iam_role="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
+    aws_my_region="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/placement/availability-zone | sed s/.$//)"
+    _security_credentials="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")"
     access_key_id="$(echo "$_security_credentials" | grep AccessKeyId | sed -e 's/  "AccessKeyId" : "//' -e 's/",$//')"
     access_key_secret="$(echo "$_security_credentials" | grep SecretAccessKey | sed -e 's/  "SecretAccessKey" : "//' -e 's/",$//')"
     security_token="$(echo "$_security_credentials" | grep Token | sed -e 's/  "Token" : "//' -e 's/",$//')"
@@ -339,17 +338,16 @@ EOF
     )
 
     response=$(
-        curl -s "https://ssm.$aws_my_region.amazonaws.com/" \
-            -x "$proxy" \
-            -H "Authorization: AWS4-HMAC-SHA256 \
-            Credential=$access_key_id/$date/$aws_my_region/ssm/aws4_request, \
-            SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target, \
-            Signature=$signature" \
-            -H "x-amz-security-token: $security_token" \
-            -H "x-amz-target: $api_endpoint" \
-            -H "content-type: application/x-amz-json-1.1" \
-            -d "$request_data" \
-            -H "x-amz-date: $datetime"
+        {
+            printf 'header = "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s/%s/ssm/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target, Signature=%s"\n' \
+                "$access_key_id" "$date" "$aws_my_region" "$signature"
+            printf 'header = "x-amz-security-token: %s"\n' "$security_token"
+            printf 'header = "x-amz-target: %s"\n' "$api_endpoint"
+            printf 'header = "content-type: application/x-amz-json-1.1"\n'
+            printf 'header = "x-amz-date: %s"\n' "$datetime"
+        } | curl -s "https://ssm.$aws_my_region.amazonaws.com/" \
+            -x "$proxy" -K- \
+            -d "$request_data"
     )
     handle_curl_error $?
     if ! echo "$response" | grep -q '^.*"InvalidParameters":\[\].*$'; then

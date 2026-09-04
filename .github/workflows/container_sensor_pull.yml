@@ -31,6 +31,9 @@ jobs:
           shellcheck --version
           shellcheck bash/containers/falcon-container-sensor-pull/falcon-container-sensor-pull.sh
 
+      - name: Unit tests
+        run: sh bash/containers/falcon-container-sensor-pull/test/test-curl-command.sh
+
   container-test:
     name: Container Test
     needs: validate

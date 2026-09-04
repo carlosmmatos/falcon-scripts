@@ -6,7 +6,7 @@ Bash script to migrate Falcon sensor from one CID to another through the Falcon 
 
 ### Use cURL version 7.55.0 or newer
 
-We have identified a security concern related to cURL versions prior to 7.55, which required request headers to be set using the `-H` option, thus allowing potential secrets to be exposed via the command line. In newer versions of cURL, you can pass headers from stdin using the `@-` syntax, which addresses this security concern. Although our script offers compatibility with the older method by allowing you to set the environment variable `ALLOW_LEGACY_CURL=true`, we strongly urge you to upgrade cURL if your environment permits.
+OAuth credentials are supplied to cURL through its configuration input rather than command-line arguments. This also lets cURL treat the bearer token as an authentication credential and prevents it from forwarding the token when a redirect crosses to another host. We strongly recommend cURL 7.55.0 or newer.
 
 To check your version of cURL, run the following command: `curl --version`
 
@@ -182,9 +182,6 @@ Other Options
         To pin the cloud region for unified sensor installations.
         This allows specifying the cloud region for unified sensors at installation time.
         Accepted values are [us-1|us-2|us-3|eu-1|us-gov-1|us-gov-2].
-
-    - ALLOW_LEGACY_CURL                 (default: false)
-        To use the legacy version of curl; version < 7.55.0.
 
     - USER_AGENT                        (default: unset)
         User agent string to append to the User-Agent header when making

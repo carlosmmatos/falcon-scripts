@@ -9,7 +9,7 @@ environment variable. Consult the Environment Variables for each script for more
 
 ### Use cURL version 7.55.0 or newer
 
-We have identified a security concern related to cURL versions prior to 7.55, which required request headers to be set using the `-H` option, thus allowing potential secrets to be exposed via the command line. In newer versions of cURL, you can pass headers from stdin using the `@-` syntax, which addresses this security concern. Although our script offers compatibility with the older method by allowing you to set the environment variable `ALLOW_LEGACY_CURL=true`, we strongly urge you to upgrade cURL if your environment permits.
+OAuth credentials are supplied to cURL through its configuration input rather than command-line arguments. This also lets cURL treat the bearer token as an authentication credential and prevents it from forwarding the token when a redirect crosses to another host. We strongly recommend cURL 7.55.0 or newer. If compatibility mode is required, `ALLOW_LEGACY_CURL=true` bypasses the version check without reverting to command-line credential handling.
 
 To check your version of cURL, run the following command: `curl --version`
 

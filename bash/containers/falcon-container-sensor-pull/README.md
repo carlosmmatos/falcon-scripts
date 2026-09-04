@@ -52,7 +52,7 @@ CrowdStrike now provides unified images that work across all regions:
 
 ### Use cURL version 7.55.0 or later
 
-We've identified a security concern related to cURL versions 7.54.1 and earlier. In these versions, request headers were set using the `-H` option, which allowed potential secrets to be exposed via the command line. In newer versions of cURL, versions 7.55.0 and later, you can pass headers from stdin using the `@-` syntax, which addresses this security concern. **We recommend that you to upgrade cURL to version 7.55.0 or later**. If this is not possible, this script offers compatibility with the older method through the use of the `--allow-legacy-curl` optional command line flag.
+OAuth credentials are supplied to cURL through its configuration input rather than command-line arguments. This also lets cURL treat the bearer token as an authentication credential and prevents it from forwarding the token when a redirect crosses to another host. **We recommend upgrading cURL to version 7.55.0 or later.** If this is not possible, `--allow-legacy-curl` bypasses the version check without reverting to command-line credential handling.
 
 To check your version of cURL, run the following command: `curl --version`
 

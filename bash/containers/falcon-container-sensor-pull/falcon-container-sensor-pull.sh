@@ -1,4 +1,17 @@
 #!/bin/bash
+
+case $- in
+    *x*)
+        set +x
+        printf '%s\n' 'WARNING: shell tracing disabled to protect credentials.' >&2
+        ;;
+esac
+
+falcon_client_secret=$FALCON_CLIENT_SECRET
+unset FALCON_CLIENT_SECRET
+FALCON_CLIENT_SECRET=$falcon_client_secret
+unset falcon_client_secret
+
 : <<'#DESCRIPTION#'
 File: falcon-container-sensor-pull.sh
 Description: Bash script to copy Falcon DaemonSet Sensor, Container Sensor, or Kubernetes Admission Controller images from CrowdStrike Container Registry.
@@ -245,8 +258,8 @@ old_curl=$(
 if [ "$old_curl" -eq 0 ]; then
     if [ "${ALLOW_LEGACY_CURL}" != "true" ]; then
         echo """
-WARNING: Your version of curl does not support the ability to pass headers via stdin.
-For security considerations, we strongly recommend upgrading to curl 7.55.0 or newer.
+WARNING: Your version of curl is below the supported 7.55.0 baseline.
+OAuth credentials remain protected from command-line exposure in compatibility mode.
 
 To bypass this warning, set the optional flag --allow-legacy-curl
 """
@@ -288,12 +301,9 @@ handle_curl_error() {
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
     local token="$1"
-    set -- "$@"
-    if [ "$old_curl" -eq 0 ]; then
-        curl -s -L -H "Authorization: Bearer ${token}" "$@"
-    else
-        echo "Authorization: Bearer ${token}" | curl -s -L -H @- "$@"
-    fi
+    shift
+    printf 'oauth2-bearer = "%s"\n' "$token" |
+        curl -s -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 
 fetch_tags() {
@@ -875,8 +885,7 @@ docker_api_token=$(echo "$raw_docker_api_token" | json_value "token")
 
 ART_PASSWORD=$(echo "$docker_api_token" | sed 's/ *$//g' | sed 's/^ *//g')
 if [ -z "$ART_PASSWORD" ]; then
-    die "Failed to retrieve the CrowdStrike registry password. Response from API:
-$raw_docker_api_token
+    die "Failed to retrieve the CrowdStrike registry password.
 
 Ensure the following:
   - Correct API Scopes assigned for sensor type: ${SENSOR_TYPE}
