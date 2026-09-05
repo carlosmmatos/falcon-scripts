@@ -1,8 +1,10 @@
 #!/bin/bash
 
 # Live two-port 307 capture for the shipped OAuth POST and fetch_tags login
-# curls. A secret that reaches hop 2 is a failure. The mock is fail-closed:
-# an unpinned control request must leak, or the harness itself is broken.
+# curls. High fail (CAND-001) is only (B): the body secret on hop 2.
+# CAND-002 logs (A) hop-2 contact vs (B) Basic/credential on hop 2; only (B)
+# fails this script as a credential leak. The mock is fail-closed: an unpinned
+# control POST must leak, or later "no leak" results are meaningless.
 
 set -euo pipefail
 
@@ -32,71 +34,32 @@ for candidate in python3 python; do
 done
 [ -n "$python_bin" ] || fail 'no python interpreter is available for the capture server'
 
-server_script="$work_dir/capture_server.py"
-cat >"$server_script" <<'PY'
-import sys
+server_script="$repo_root/.github/scripts/redirect-capture-server.py"
+[ -f "$server_script" ] || fail "missing $server_script"
 
-try:
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-except ImportError:
-    from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
-
-output_path = sys.argv[1]
-redirect_to = sys.argv[2] if len(sys.argv) > 2 else ""
-
-
-class Handler(BaseHTTPRequestHandler):
-    def _capture(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length) if length else b""
-        try:
-            body_text = body.decode("utf-8")
-        except UnicodeDecodeError:
-            body_text = repr(body)
-        with open(output_path, "w") as handle:
-            handle.write("REQUEST_ARRIVED|auth=[%s]|body=[%s]"
-                         % (self.headers.get("Authorization", ""), body_text))
-
-    def _respond(self):
-        if redirect_to:
-            self.send_response(307)
-            self.send_header("Location", redirect_to)
-            self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"access_token":"mock","token":"mock"}')
-
-    def do_GET(self):
-        self._capture()
-        self._respond()
-
-    def do_POST(self):
-        self._capture()
-        self._respond()
-
-    def log_message(self, *args):
-        pass
-
-
-HTTPServer.allow_reuse_address = True
-server = HTTPServer(("127.0.0.1", 0), Handler)
-port = server.server_address[1]
-with open(output_path + ".port", "w") as handle:
-    handle.write(str(port))
-with open(output_path + ".ready", "w") as handle:
-    handle.write("ready")
-server.timeout = 20
-server.handle_request()
-PY
+tls_cert=""
+tls_key=""
+if command -v openssl >/dev/null 2>&1; then
+    openssl req -x509 -newkey rsa:2048 -keyout "$work_dir/key.pem" -out "$work_dir/cert.pem" \
+        -days 1 -nodes -subj '/CN=127.0.0.1' >/dev/null 2>&1
+    tls_cert="$work_dir/cert.pem"
+    tls_key="$work_dir/key.pem"
+fi
 
 start_server() {
     output=$1
     redirect_to=${2:-}
+    use_tls=${3:-}
 
     rm -f "$output" "$output.ready" "$output.port"
-    "$python_bin" "$server_script" "$output" "$redirect_to" &
+    if [ -n "$use_tls" ]; then
+        [ -n "$tls_cert" ] || fail 'HTTPS capture requested but openssl/cert is unavailable'
+        [ -n "$redirect_to" ] || redirect_to='-'
+        "$python_bin" "$server_script" "$output" "$redirect_to" "$tls_cert" "$tls_key" &
+    else
+        [ -n "$redirect_to" ] || redirect_to='-'
+        "$python_bin" "$server_script" "$output" "$redirect_to" &
+    fi
     server_pids="$server_pids $!"
 }
 
@@ -118,13 +81,33 @@ start_redirect_pair() {
     hop1=$1
     hop2=$2
     hop2_path=$3
+    scheme=${4:-http}
 
-    start_server "$hop2"
+    use_tls=""
+    [ "$scheme" = https ] && use_tls=yes
+    start_server "$hop2" "" "$use_tls"
     wait_for_server "$hop2"
     hop2_port=$(cat "$hop2.port")
-    start_server "$hop1" "http://127.0.0.1:${hop2_port}${hop2_path}"
+    start_server "$hop1" "${scheme}://127.0.0.1:${hop2_port}${hop2_path}" "$use_tls"
     wait_for_server "$hop1"
     hop1_port=$(cat "$hop1.port")
+}
+
+# (A) hop 2 was contacted. (B) the named credential string is in the hop 2
+# capture. Only (B) is a High credential leak.
+report_ab() {
+    local cand=$1 hop2=$2 pattern=$3
+    if [ -s "$hop2" ]; then
+        echo "$cand (A) hop2_contacted=yes capture=$(cat "$hop2")"
+    else
+        echo "$cand (A) hop2_contacted=no"
+    fi
+    if [ -s "$hop2" ] && grep -qE -- "$pattern" "$hop2"; then
+        echo "$cand (B) credential_on_hop2=yes"
+        return 0
+    fi
+    echo "$cand (B) credential_on_hop2=no"
+    return 1
 }
 
 assert_hop2_has_secret() {
@@ -188,6 +171,12 @@ replay_recorded_curl() {
         esac
         replay_args+=("$arg")
     done <"$args_file"
+
+    case $url in
+        https://*)
+            replay_args=(--insecure "${replay_args[@]}")
+            ;;
+    esac
 
     set +e
     curl --silent --show-error "${replay_args[@]}" <"$stdin_file" >/dev/null
@@ -291,15 +280,15 @@ test_shipped_oauth_redirect() {
     tr '\n' ' ' <"$work_dir/oauth-args"
     echo
 
-    start_redirect_pair "$work_dir/oa1" "$work_dir/oa2" "/oauth2/token"
+    start_redirect_pair "$work_dir/oa1" "$work_dir/oa2" "/oauth2/token" https
     replay_recorded_curl \
         "$work_dir/oauth-args" \
         "$work_dir/oauth-stdin" \
-        "http://127.0.0.1:$(cat "$work_dir/oa1.port")/oauth2/token"
+        "https://127.0.0.1:$(cat "$work_dir/oa1.port")/oauth2/token"
     echo "hop1 capture ($script): $(cat "$work_dir/oa1" 2>/dev/null || echo '<missing>')"
     echo "hop2 capture ($script): $(cat "$work_dir/oa2" 2>/dev/null || echo '<missing>')"
-    if [ -s "$work_dir/oa2" ] && grep -qF 'REGRESSION_SECRET' "$work_dir/oa2"; then
-        echo "FAIL: $script oauth POST replayed against a 307 chain (secret reached hop 2: $(cat "$work_dir/oa2"))" >&2
+    if report_ab "CAND-001 $script" "$work_dir/oa2" 'REGRESSION_SECRET'; then
+        echo "FAIL: $script oauth POST HTTPS→HTTPS 307 (B) body secret on hop 2" >&2
         oauth_failures=$((oauth_failures + 1))
     fi
 }
@@ -341,25 +330,26 @@ record_fetch_tags_curl() {
     )
 }
 
-# CAND-002: replay the shipped fetch_tags login curl. Fail if Basic auth or
-# the registry password reaches hop 2.
+# CAND-002: replay the shipped fetch_tags login curl over HTTPS→HTTPS.
+# (A) hop 2 contacted is a proto-pin / follow gap (Medium at most).
+# (B) Basic auth or the password on hop 2 is the only High leak.
 record_fetch_tags_curl \
     bash/containers/falcon-container-sensor-pull/falcon-container-sensor-pull.sh
 echo "recorded fetch_tags argv:"
 tr '\n' ' ' <"$work_dir/ft-args"
 echo
-start_redirect_pair "$work_dir/ft1" "$work_dir/ft2" "/v2/token"
+start_redirect_pair "$work_dir/ft1" "$work_dir/ft2" "/v2/token" https
 replay_recorded_curl \
     "$work_dir/ft-args" \
     "$work_dir/ft-stdin" \
-    "http://127.0.0.1:$(cat "$work_dir/ft1.port")/v2/token"
+    "https://127.0.0.1:$(cat "$work_dir/ft1.port")/v2/token"
+echo "hop1 capture (fetch_tags): $(cat "$work_dir/ft1" 2>/dev/null || echo '<missing>')"
 echo "hop2 capture (fetch_tags): $(cat "$work_dir/ft2" 2>/dev/null || echo '<missing>')"
-if grep -qF 'REGRESSION_BASIC' "$work_dir/ft2" ||
-    grep -qF 'dXNlcjpSRUdSRVNTSU9OX0JBU0lD' "$work_dir/ft2"; then
-    fail "fetch_tags registry login forwarded Basic auth to hop 2: $(cat "$work_dir/ft2")"
+[ -s "$work_dir/ft2" ] || fail 'CAND-002 inconclusive: hop 2 was not contacted (cannot assert (B))'
+if report_ab 'CAND-002 fetch_tags' "$work_dir/ft2" \
+    'REGRESSION_BASIC|dXNlcjpSRUdSRVNTSU9OX0JBU0lD|auth=\[Basic'; then
+    fail "CAND-002 (B): fetch_tags forwarded Basic auth to hop 2: $(cat "$work_dir/ft2")"
 fi
-[ -s "$work_dir/ft2" ] || fail 'fetch_tags replay never reached hop 2'
-echo "fetch_tags: hop 2 did not receive REGRESSION_BASIC"
 
 if [ "$oauth_failures" -ne 0 ]; then
     fail "$oauth_failures shipped oauth POST call site(s) leaked REGRESSION_SECRET to hop 2"

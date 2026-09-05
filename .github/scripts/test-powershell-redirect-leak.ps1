@@ -1,6 +1,7 @@
-# Live HttpListener 307 chain for Invoke-FalconAuth and Invoke-FalconDownload.
-# Hop listeners run in child pwsh processes so IWR cannot deadlock the listener.
-# A client_secret or bearer token that reaches hop 2 is a failure.
+# Live 307 chain for Invoke-FalconAuth and Invoke-FalconDownload.
+# High fail is only (B): client_secret or Authorization bearer on hop 2.
+# (A) hop-2 contact without the credential is a follow/policy gap, not High.
+# Modern PowerShell blocks HTTPS→HTTP, so the leak sink is HTTPS→HTTPS.
 
 [CmdletBinding()]
 param(
@@ -50,10 +51,28 @@ if ($HopListener) {
 }
 
 $RepositoryRoot = Resolve-Path (Join-Path $PSScriptRoot '../..')
+$ServerScript = Join-Path $RepositoryRoot '.github/scripts/redirect-capture-server.py'
+if (-not (Test-Path $ServerScript)) {
+    throw "missing capture server $ServerScript"
+}
 $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("falcon-iwr-redir-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $Failures = [System.Collections.Generic.List[string]]::new()
 $ChildProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+
+$Cert = Join-Path $WorkDir 'cert.pem'
+$Key = Join-Path $WorkDir 'key.pem'
+& openssl req -x509 -newkey rsa:2048 -keyout $Key -out $Cert -days 1 -nodes -subj '/CN=127.0.0.1' 2>$null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Cert)) {
+    throw 'openssl failed to create a hermetic TLS certificate'
+}
+
+$Python = $null
+foreach ($candidate in @('python3', 'python')) {
+    $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($cmd) { $Python = $cmd.Source; break }
+}
+if (-not $Python) { throw 'no python interpreter is available for the HTTPS capture server' }
 
 function Get-FreePort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -69,10 +88,24 @@ function Wait-Ready {
         if (Test-Path $Path) { return }
         Start-Sleep -Milliseconds 100
     }
-    throw "HttpListener did not start: $Path"
+    throw "capture server did not start: $Path"
 }
 
-function Start-Hop {
+function Start-HttpsHop {
+    param(
+        [string] $CapturePath,
+        [string] $RedirectTo
+    )
+    Remove-Item $CapturePath, "$CapturePath.ready", "$CapturePath.port" -ErrorAction SilentlyContinue
+    $redirectArg = if ($RedirectTo) { $RedirectTo } else { '-' }
+    $argumentList = @($ServerScript, $CapturePath, $redirectArg, $Cert, $Key)
+    $proc = Start-Process -FilePath $Python -ArgumentList $argumentList -PassThru
+    $ChildProcesses.Add($proc)
+    Wait-Ready "$CapturePath.ready"
+    return [int](Get-Content -Raw "$CapturePath.port").Trim()
+}
+
+function Start-HttpHop {
     param(
         [int] $Port,
         [string] $CapturePath,
@@ -99,6 +132,28 @@ function Read-Capture {
     param([string] $Path)
     if (Test-Path $Path) { return (Get-Content -Raw $Path).Trim() }
     return '<missing>'
+}
+
+function Report-AB {
+    param(
+        [string] $Candidate,
+        [string] $Hop2Path,
+        [string] $Pattern
+    )
+    $text = Read-Capture $Hop2Path
+    # Write-Host so callers can `if (Report-AB)` on the boolean only.
+    if ($text -ne '<missing>') {
+        Write-Host "$Candidate (A) hop2_contacted=yes capture=$text"
+    }
+    else {
+        Write-Host "$Candidate (A) hop2_contacted=no"
+    }
+    if ($text -ne '<missing>' -and $text -match $Pattern) {
+        Write-Host "$Candidate (B) credential_on_hop2=yes"
+        return $true
+    }
+    Write-Host "$Candidate (B) credential_on_hop2=no"
+    return $false
 }
 
 function Get-FunctionText {
@@ -131,7 +186,7 @@ try {
     $FalconAccessToken = $null
     function Write-FalconLog { param($Source, $Message, $stdout) }
     function Write-VerboseLog { param($VerboseInput, $PreMessage) }
-    function Get-FalconCloud { param($xCsRegion) return "http://127.0.0.1" }
+    function Get-FalconCloud { param($xCsRegion) return 'https://127.0.0.1' }
     function Format-403Error { param($url, $scope) return "403 $url" }
 
     $authScripts = @(
@@ -142,12 +197,10 @@ try {
 
     foreach ($relativePath in $authScripts) {
         $path = Join-Path $RepositoryRoot $relativePath
-        $hop1Port = Get-FreePort
-        $hop2Port = Get-FreePort
         $hop1 = Join-Path $WorkDir ("auth-hop1-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
         $hop2 = Join-Path $WorkDir ("auth-hop2-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
-        [void](Start-Hop -Port $hop2Port -CapturePath $hop2 -RedirectTo $null)
-        [void](Start-Hop -Port $hop1Port -CapturePath $hop1 -RedirectTo "http://127.0.0.1:$hop2Port/oauth2/token")
+        $hop2Port = Start-HttpsHop -CapturePath $hop2 -RedirectTo $null
+        $hop1Port = Start-HttpsHop -CapturePath $hop1 -RedirectTo "https://127.0.0.1:$hop2Port/oauth2/token"
 
         Invoke-Expression (Get-FunctionText -Path $path -Name 'Invoke-FalconAuth')
         $body = @{
@@ -155,19 +208,20 @@ try {
             client_secret = 'REGRESSION_SECRET'
         }
         try {
-            $null = Invoke-FalconAuth -WebRequestParams @{} -BaseUrl "http://127.0.0.1:$hop1Port" -Body $body -FalconCloud 'us-1'
+            $null = Invoke-FalconAuth -WebRequestParams @{ SkipCertificateCheck = $true } -BaseUrl "https://127.0.0.1:$hop1Port" -Body $body -FalconCloud 'us-1'
         }
         catch {
             Write-Output "${relativePath}: Invoke-FalconAuth threw $($_.Exception.Message)"
         }
 
         Start-Sleep -Milliseconds 300
-        $hop1Text = Read-Capture $hop1
-        $hop2Text = Read-Capture $hop2
-        Write-Output "${relativePath} Invoke-FalconAuth hop1: $hop1Text"
-        Write-Output "${relativePath} Invoke-FalconAuth hop2: $hop2Text"
-        if ($hop2Text -match 'REGRESSION_SECRET') {
-            $Failures.Add("${relativePath}: Invoke-FalconAuth leaked client_secret to hop 2 ($hop2Text)")
+        Write-Output "${relativePath} Invoke-FalconAuth hop1: $(Read-Capture $hop1)"
+        Write-Output "${relativePath} Invoke-FalconAuth hop2: $(Read-Capture $hop2)"
+        if ((Read-Capture $hop2) -eq '<missing>') {
+            $Failures.Add("${relativePath}: CAND-003 inconclusive — hop 2 was not contacted")
+        }
+        elseif (Report-AB -Candidate "CAND-003 $relativePath" -Hop2Path $hop2 -Pattern 'REGRESSION_SECRET') {
+            $Failures.Add("${relativePath}: CAND-003 (B) Invoke-FalconAuth leaked client_secret to hop 2 ($(Read-Capture $hop2))")
         }
         Stop-Children
         Remove-Item Function:Invoke-FalconAuth -ErrorAction SilentlyContinue
@@ -181,22 +235,22 @@ try {
     foreach ($entry in $downloadScripts) {
         $relativePath = $entry.Path
         $path = Join-Path $RepositoryRoot $relativePath
-        $hop1Port = Get-FreePort
-        $hop2Port = Get-FreePort
         $hop1 = Join-Path $WorkDir ("dl-hop1-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
         $hop2 = Join-Path $WorkDir ("dl-hop2-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
-        [void](Start-Hop -Port $hop2Port -CapturePath $hop2 -RedirectTo $null)
-        [void](Start-Hop -Port $hop1Port -CapturePath $hop1 -RedirectTo "http://127.0.0.1:$hop2Port/file")
+        $hop2Port = Start-HttpsHop -CapturePath $hop2 -RedirectTo $null
+        $hop1Port = Start-HttpsHop -CapturePath $hop1 -RedirectTo "https://127.0.0.1:$hop2Port/file"
 
         Invoke-Expression (Get-FunctionText -Path $path -Name 'Invoke-FalconDownload')
         $outFile = Join-Path $WorkDir ("dl-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.bin')
         $headers = @{ Authorization = 'bearer REGRESSION_BEARER' }
+        $webParams = @{ SkipCertificateCheck = $true }
         try {
             if ($entry.HasHeadersParam) {
-                Invoke-FalconDownload -WebRequestParams @{} -url "http://127.0.0.1:$hop1Port/file" -Outfile $outFile -Headers $headers
+                Invoke-FalconDownload -WebRequestParams $webParams -url "https://127.0.0.1:$hop1Port/file" -Outfile $outFile -Headers $headers
             }
             else {
-                Invoke-FalconDownload -WebRequestParams @{ Headers = $headers } -url "http://127.0.0.1:$hop1Port/file" -Outfile $outFile
+                $webParams['Headers'] = $headers
+                Invoke-FalconDownload -WebRequestParams $webParams -url "https://127.0.0.1:$hop1Port/file" -Outfile $outFile
             }
         }
         catch {
@@ -204,12 +258,13 @@ try {
         }
 
         Start-Sleep -Milliseconds 300
-        $hop1Text = Read-Capture $hop1
-        $hop2Text = Read-Capture $hop2
-        Write-Output "${relativePath} Invoke-FalconDownload hop1: $hop1Text"
-        Write-Output "${relativePath} Invoke-FalconDownload hop2: $hop2Text"
-        if ($hop2Text -match 'REGRESSION_BEARER') {
-            $Failures.Add("${relativePath}: Invoke-FalconDownload leaked Authorization bearer to hop 2 ($hop2Text)")
+        Write-Output "${relativePath} Invoke-FalconDownload hop1: $(Read-Capture $hop1)"
+        Write-Output "${relativePath} Invoke-FalconDownload hop2: $(Read-Capture $hop2)"
+        if ((Read-Capture $hop2) -eq '<missing>') {
+            $Failures.Add("${relativePath}: CAND-004 inconclusive — hop 2 was not contacted")
+        }
+        elseif (Report-AB -Candidate "CAND-004 $relativePath" -Hop2Path $hop2 -Pattern 'REGRESSION_BEARER') {
+            $Failures.Add("${relativePath}: CAND-004 (B) Invoke-FalconDownload leaked Authorization bearer to hop 2 ($(Read-Capture $hop2))")
         }
         Stop-Children
         Remove-Item Function:Invoke-FalconDownload -ErrorAction SilentlyContinue
@@ -220,8 +275,8 @@ try {
     $ctrl2Port = Get-FreePort
     $ctrl1 = Join-Path $WorkDir 'max0-hop1.txt'
     $ctrl2 = Join-Path $WorkDir 'max0-hop2.txt'
-    [void](Start-Hop -Port $ctrl2Port -CapturePath $ctrl2 -RedirectTo $null)
-    [void](Start-Hop -Port $ctrl1Port -CapturePath $ctrl1 -RedirectTo "http://127.0.0.1:$ctrl2Port/oauth2/token")
+    [void](Start-HttpHop -Port $ctrl2Port -CapturePath $ctrl2 -RedirectTo $null)
+    [void](Start-HttpHop -Port $ctrl1Port -CapturePath $ctrl1 -RedirectTo "http://127.0.0.1:$ctrl2Port/oauth2/token")
     try {
         Invoke-WebRequest -Uri "http://127.0.0.1:$ctrl1Port/oauth2/token" -UseBasicParsing -Method POST -Body @{ client_secret = 'REGRESSION_SECRET' } -MaximumRedirection 0 | Out-Null
         $Failures.Add('control: -MaximumRedirection 0 unexpectedly followed the 307')
