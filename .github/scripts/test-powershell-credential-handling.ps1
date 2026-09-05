@@ -76,10 +76,42 @@ foreach ($RelativePath in $Scripts) {
         }
     }
 
-    # CAND-004 is Medium (A)-only on modern pwsh: Authorization is stripped on
-    # redirect follow. Do not require -MaximumRedirection 0 on
-    # Invoke-FalconDownload — CDN 302 may be required for installer downloads.
-    # Keep the MaxRedirection 0 requirement for Invoke-FalconAuth oauth POSTs only.
+    # CAND-004 Medium (A): Invoke-FalconDownload must strip Authorization before
+    # following a CDN redirect. Do not require -MaximumRedirection 0 alone on
+    # download paths (CDN 302 must still work via a second unauthenticated GET).
+    $DownloadScripts = @(
+        'powershell/install/falcon_windows_install.ps1'
+        'powershell/migrate/falcon_windows_migrate.ps1'
+    )
+    if ($RelativePath -in $DownloadScripts) {
+        $DownloadFunctions = $Ast.FindAll({
+            param($Node)
+            $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $Node.Name -eq 'Invoke-FalconDownload'
+        }, $true)
+        if ($DownloadFunctions.Count -eq 0) {
+            $Failures.Add("${RelativePath}: Invoke-FalconDownload was not found")
+        }
+        foreach ($Function in $DownloadFunctions) {
+            $Text = $Function.Extent.Text
+            if ($Text -notmatch "headerName\s+-ne\s+'Authorization'" -and
+                $Text -notmatch '\$headerName\s+-ne\s+"Authorization"') {
+                $Failures.Add("${RelativePath}:$($Function.Extent.StartLineNumber): Invoke-FalconDownload does not strip Authorization before following redirects")
+            }
+            if ($Text -notmatch "Scheme\s+-ne\s+'https'") {
+                $Failures.Add("${RelativePath}:$($Function.Extent.StartLineNumber): Invoke-FalconDownload does not refuse non-HTTPS download redirects")
+            }
+            # Ensure the follow request still downloads (CDN 302 path intact).
+            $IwrCommands = $Function.FindAll({
+                param($Node)
+                $Node -is [System.Management.Automation.Language.CommandAst] -and
+                $Node.GetCommandName() -eq 'Invoke-WebRequest'
+            }, $true)
+            if ($IwrCommands.Count -lt 2) {
+                $Failures.Add("${RelativePath}:$($Function.Extent.StartLineNumber): Invoke-FalconDownload must manually follow redirects with a second GET (found $($IwrCommands.Count) Invoke-WebRequest)")
+            }
+        }
+    }
 }
 
 if ($Failures.Count -gt 0) {

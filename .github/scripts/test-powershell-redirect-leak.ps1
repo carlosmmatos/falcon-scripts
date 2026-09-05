@@ -234,6 +234,8 @@ try {
     foreach ($entry in $downloadScripts) {
         $relativePath = $entry.Path
         $path = Join-Path $RepositoryRoot $relativePath
+
+        # CAND-004 Medium: HTTPS CDN 302 must be followed without Authorization.
         $hop1 = Join-Path $WorkDir ("dl-hop1-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
         $hop2 = Join-Path $WorkDir ("dl-hop2-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
         $hop2Port = Start-HttpsHop -CapturePath $hop2 -RedirectTo $null
@@ -257,12 +259,55 @@ try {
         }
 
         Start-Sleep -Milliseconds 300
+        $hop2Text = Read-Capture $hop2
         Write-Output "${relativePath} Invoke-FalconDownload hop1: $(Read-Capture $hop1)"
-        Write-Output "${relativePath} Invoke-FalconDownload hop2: $(Read-Capture $hop2)"
-        # Hop 2 missing is (B)=no and PASS. Fail only when the bearer is present
-        # on hop 2; (A)-only contact without the credential is not High.
-        if (Report-AB -Candidate "CAND-004 $relativePath" -Hop2Path $hop2 -Pattern 'REGRESSION_BEARER') {
-            $Failures.Add("${relativePath}: CAND-004 (B) Invoke-FalconDownload leaked Authorization bearer to hop 2 ($(Read-Capture $hop2))")
+        Write-Output "${relativePath} Invoke-FalconDownload hop2: $hop2Text"
+        # Medium (A) defense-in-depth: CDN follow must happen, without Authorization.
+        # Do not treat empty hop-2 as a High (B) leak — that would reopen CAND-004 as High.
+        if ($hop2Text -eq '<missing>') {
+            $Failures.Add("${relativePath}: CAND-004 (A) Invoke-FalconDownload did not follow HTTPS CDN redirect (hop 2 missing)")
+        }
+        elseif ($hop2Text -match 'REGRESSION_BEARER') {
+            $Failures.Add("${relativePath}: CAND-004 (A) Invoke-FalconDownload sent Authorization to hop 2 ($hop2Text)")
+        }
+        else {
+            Write-Host "CAND-004 $relativePath (A) https_follow_ok hop2_auth_stripped=yes"
+        }
+        Stop-Children
+        Remove-Item Function:Invoke-FalconDownload -ErrorAction SilentlyContinue
+
+        # CAND-004 Medium (A): must not follow http:// download redirects.
+        $httpHop2 = Join-Path $WorkDir ("dl-http-hop2-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
+        $httpHop2Port = Get-FreePort
+        [void](Start-HttpHop -Port $httpHop2Port -CapturePath $httpHop2 -RedirectTo $null)
+        $httpsToHttpHop1 = Join-Path $WorkDir ("dl-https-http-hop1-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.txt')
+        $httpsToHttpPort = Start-HttpsHop -CapturePath $httpsToHttpHop1 -RedirectTo "http://127.0.0.1:$httpHop2Port/file"
+
+        Invoke-Expression (Get-FunctionText -Path $path -Name 'Invoke-FalconDownload')
+        $httpOut = Join-Path $WorkDir ("dl-http-" + [IO.Path]::GetFileNameWithoutExtension($relativePath) + '.bin')
+        $webParamsHttp = @{ SkipCertificateCheck = $true }
+        try {
+            if ($entry.HasHeadersParam) {
+                Invoke-FalconDownload -WebRequestParams $webParamsHttp -url "https://127.0.0.1:$httpsToHttpPort/file" -Outfile $httpOut -Headers $headers
+            }
+            else {
+                $webParamsHttp['Headers'] = $headers
+                Invoke-FalconDownload -WebRequestParams $webParamsHttp -url "https://127.0.0.1:$httpsToHttpPort/file" -Outfile $httpOut
+            }
+            $Failures.Add("${relativePath}: CAND-004 (A) Invoke-FalconDownload followed or accepted an http:// download redirect without error")
+        }
+        catch {
+            Write-Output "${relativePath}: Invoke-FalconDownload http redirect rejected as expected ($($_.Exception.Message))"
+        }
+
+        Start-Sleep -Milliseconds 300
+        $httpHop2Text = Read-Capture $httpHop2
+        Write-Output "${relativePath} Invoke-FalconDownload http hop2: $httpHop2Text"
+        if ($httpHop2Text -ne '<missing>') {
+            $Failures.Add("${relativePath}: CAND-004 (A) Invoke-FalconDownload contacted http:// hop 2 ($httpHop2Text)")
+        }
+        else {
+            Write-Host "CAND-004 $relativePath (A) http_follow_blocked=yes"
         }
         Stop-Children
         Remove-Item Function:Invoke-FalconDownload -ErrorAction SilentlyContinue
