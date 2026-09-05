@@ -2,13 +2,15 @@
 
 # Live two-port 307 capture for the shipped OAuth POST and fetch_tags login
 # curls. High fail (CAND-001) is only (B): the body secret on hop 2.
-# CAND-002 logs (A) hop-2 contact vs (B) Basic/credential on hop 2; only (B)
-# fails this script as a credential leak. The mock is fail-closed: an unpinned
-# control POST must leak, or later "no leak" results are meaningless.
+# CAND-002 Medium (A): hop-2 contact on the fetch_tags registry login curl is
+# the fail signal (proto-pin / -L gap). (B) Basic-on-hop2 is already killed for
+# High elsewhere; this script does not elevate CAND-002 to High. The mock is
+# fail-closed: an unpinned control POST must leak, or later "no leak" results
+# are meaningless.
 #
-# OAuth POSTs must also omit -L/--location: curl replays the credential body on
-# a 307/308 follow, and an https→https redirect defeats --proto-redir '=https'.
-# Hop 2 missing is a PASS for CAND-001 (expected when follow is disabled).
+# OAuth POSTs and the fetch_tags token curl must omit -L/--location: curl can
+# follow an https→https redirect that defeats --proto-redir '=https'. Hop 2
+# missing is a PASS for CAND-001 and for CAND-002 (A) when follow is disabled.
 
 set -euo pipefail
 
@@ -364,14 +366,66 @@ record_fetch_tags_curl() {
     )
 }
 
-# CAND-002: replay the shipped fetch_tags login curl over HTTPS→HTTPS.
-# (A) hop 2 contacted is a proto-pin / follow gap (Medium at most).
-# (B) Basic auth or the password on hop 2 is the only High leak.
+# Standalone -L/--location on the shipped fetch_tags login curl would follow a
+# 307/308. Reject those flags (and require proto pins) before the live replay
+# so reintroducing follow or dropping pins fails closed even if hop-2 capture
+# softens.
+assert_fetch_tags_hardened() {
+    local args_file=$1
+    local arg has_proto="" has_proto_redir=""
+
+    while IFS= read -r arg; do
+        case $arg in
+            -L | --location | --location-trusted)
+                echo "FAIL: fetch_tags token curl still follows redirects ($arg)" >&2
+                return 1
+                ;;
+            --proto)
+                has_proto=yes
+                ;;
+            --proto-redir)
+                has_proto_redir=yes
+                ;;
+        esac
+    done <"$args_file"
+
+    if [ -z "$has_proto" ]; then
+        echo "FAIL: fetch_tags token curl missing --proto pin" >&2
+        return 1
+    fi
+    if [ -z "$has_proto_redir" ]; then
+        echo "FAIL: fetch_tags token curl missing --proto-redir pin" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Prove the argv assertion itself is fail-closed: missing pins, or lingering
+# -L, must not be reported as a pass.
+{
+    printf '%s\n' -s -L -K- >"$work_dir/ft-unpinned-argv"
+    if assert_fetch_tags_hardened "$work_dir/ft-unpinned-argv" 2>/dev/null; then
+        fail 'CAND-002 bar is fail-open: fetch_tags argv with -L was accepted'
+    fi
+    printf '%s\n' -s -K- >"$work_dir/ft-nopin-argv"
+    if assert_fetch_tags_hardened "$work_dir/ft-nopin-argv" 2>/dev/null; then
+        fail 'CAND-002 bar is fail-open: fetch_tags argv without proto pins was accepted'
+    fi
+}
+
+# CAND-002 Medium (A): replay the shipped fetch_tags login curl over
+# HTTPS→HTTPS. Hop-2 contact (or missing pins / lingering -L) fails closed.
+# Do not claim High (B) Basic-on-hop2 here.
 record_fetch_tags_curl \
     bash/containers/falcon-container-sensor-pull/falcon-container-sensor-pull.sh
 echo "recorded fetch_tags argv:"
 tr '\n' ' ' <"$work_dir/ft-args"
 echo
+
+if ! assert_fetch_tags_hardened "$work_dir/ft-args"; then
+    fail 'CAND-002: fetch_tags token curl is missing proto pins or still follows redirects'
+fi
+
 start_redirect_pair "$work_dir/ft1" "$work_dir/ft2" "/v2/token" https
 replay_recorded_curl \
     "$work_dir/ft-args" \
@@ -379,10 +433,17 @@ replay_recorded_curl \
     "https://127.0.0.1:$(cat "$work_dir/ft1.port")/v2/token"
 echo "hop1 capture (fetch_tags): $(cat "$work_dir/ft1" 2>/dev/null || echo '<missing>')"
 echo "hop2 capture (fetch_tags): $(cat "$work_dir/ft2" 2>/dev/null || echo '<missing>')"
-[ -s "$work_dir/ft2" ] || fail 'CAND-002 inconclusive: hop 2 was not contacted (cannot assert (B))'
-if report_ab 'CAND-002 fetch_tags' "$work_dir/ft2" \
-    'REGRESSION_BASIC|dXNlcjpSRUdSRVNTSU9OX0JBU0lD|auth=\[Basic'; then
-    fail "CAND-002 (B): fetch_tags forwarded Basic auth to hop 2: $(cat "$work_dir/ft2")"
+
+# Harness integrity: the recorded request must hit hop 1 with Basic, or a
+# later hop-2-empty PASS would be meaningless (fail-open).
+if ! [ -s "$work_dir/ft1" ] || ! grep -qE 'REGRESSION_BASIC|dXNlcjpSRUdSRVNTSU9OX0JBU0lD|auth=\[Basic' "$work_dir/ft1"; then
+    fail 'CAND-002: fetch_tags login never delivered Basic credentials to hop 1'
+fi
+
+report_ab 'CAND-002 fetch_tags' "$work_dir/ft2" \
+    'REGRESSION_BASIC|dXNlcjpSRUdSRVNTSU9OX0JBU0lD|auth=\[Basic' || true
+if [ -s "$work_dir/ft2" ]; then
+    fail "CAND-002 (A): fetch_tags contacted hop 2 (proto-pin/-L gap): $(cat "$work_dir/ft2")"
 fi
 
 if [ "$oauth_failures" -ne 0 ]; then

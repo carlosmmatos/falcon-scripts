@@ -248,7 +248,7 @@ check_proto_pins \
 
 test_fetch_tags_curl_pins() {
     local script=$1
-    local helper args_file stdin_file
+    local helper args_file stdin_file arg
 
     helper=$(awk '/^fetch_tags\(\)/,/^}/' "$repo_root/$script")
     [ -n "$helper" ] || fail "fetch_tags not found in $script"
@@ -281,6 +281,17 @@ test_fetch_tags_curl_pins() {
     grep -qF 'REGRESSION_BASIC' "$stdin_file" ||
         fail "$script fetch_tags did not pass registry credentials on curl stdin"
     check_proto_pins "$script fetch_tags registry login" "$args_file"
+
+    # CAND-002: registry token curl must not follow redirects (same pattern as
+    # oauth POSTs). Reintroducing -L fails closed here without a live mock.
+    while IFS= read -r arg; do
+        case $arg in
+            -L | --location | --location-trusted)
+                echo "FAIL: $script fetch_tags still follows redirects ($arg)" >&2
+                pin_failures=$((pin_failures + 1))
+                ;;
+        esac
+    done <"$args_file"
 }
 
 test_fetch_tags_curl_pins \
@@ -360,7 +371,7 @@ assert_no_match \
     powershell '*.ps1'
 
 if [ "$pin_failures" -ne 0 ]; then
-    fail "$pin_failures shipped oauth/fetch_tags curl invocation(s) are missing --proto/--proto-redir"
+    fail "$pin_failures shipped oauth/fetch_tags curl invocation(s) are missing --proto/--proto-redir or still follow redirects"
 fi
 
 echo 'PASS: credential handling regression checks'
