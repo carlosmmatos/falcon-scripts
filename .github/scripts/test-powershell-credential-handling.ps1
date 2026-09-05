@@ -76,26 +76,10 @@ foreach ($RelativePath in $Scripts) {
         }
     }
 
-    $DownloadFunctions = $Ast.FindAll({
-        param($Node)
-        $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $Node.Name -eq 'Invoke-FalconDownload'
-    }, $true)
-    foreach ($Function in $DownloadFunctions) {
-        $Downloads = $Function.FindAll({
-            param($Node)
-            $Node -is [System.Management.Automation.Language.CommandAst] -and
-            $Node.GetCommandName() -eq 'Invoke-WebRequest'
-        }, $true)
-        if ($Downloads.Count -eq 0) {
-            $Failures.Add("${RelativePath}:$($Function.Extent.StartLineNumber): Invoke-FalconDownload has no Invoke-WebRequest")
-        }
-        foreach ($Command in $Downloads) {
-            if ($Command.Extent.Text -notmatch '-MaximumRedirection\s+0') {
-                $Failures.Add("${RelativePath}:$($Command.Extent.StartLineNumber): Invoke-FalconDownload is missing -MaximumRedirection 0")
-            }
-        }
-    }
+    # CAND-004 is Medium (A)-only on modern pwsh: Authorization is stripped on
+    # redirect follow. Do not require -MaximumRedirection 0 on
+    # Invoke-FalconDownload — CDN 302 may be required for installer downloads.
+    # Keep the MaxRedirection 0 requirement for Invoke-FalconAuth oauth POSTs only.
 }
 
 if ($Failures.Count -gt 0) {

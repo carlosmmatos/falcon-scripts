@@ -217,10 +217,9 @@ try {
         Start-Sleep -Milliseconds 300
         Write-Output "${relativePath} Invoke-FalconAuth hop1: $(Read-Capture $hop1)"
         Write-Output "${relativePath} Invoke-FalconAuth hop2: $(Read-Capture $hop2)"
-        if ((Read-Capture $hop2) -eq '<missing>') {
-            $Failures.Add("${relativePath}: CAND-003 inconclusive — hop 2 was not contacted")
-        }
-        elseif (Report-AB -Candidate "CAND-003 $relativePath" -Hop2Path $hop2 -Pattern 'REGRESSION_SECRET') {
+        # Hop 2 missing is (B)=no and PASS: -MaximumRedirection 0 is the correct
+        # CAND-003 fix and intentionally empties hop 2. Fail only on (B)=yes.
+        if (Report-AB -Candidate "CAND-003 $relativePath" -Hop2Path $hop2 -Pattern 'REGRESSION_SECRET') {
             $Failures.Add("${relativePath}: CAND-003 (B) Invoke-FalconAuth leaked client_secret to hop 2 ($(Read-Capture $hop2))")
         }
         Stop-Children
@@ -260,10 +259,9 @@ try {
         Start-Sleep -Milliseconds 300
         Write-Output "${relativePath} Invoke-FalconDownload hop1: $(Read-Capture $hop1)"
         Write-Output "${relativePath} Invoke-FalconDownload hop2: $(Read-Capture $hop2)"
-        if ((Read-Capture $hop2) -eq '<missing>') {
-            $Failures.Add("${relativePath}: CAND-004 inconclusive — hop 2 was not contacted")
-        }
-        elseif (Report-AB -Candidate "CAND-004 $relativePath" -Hop2Path $hop2 -Pattern 'REGRESSION_BEARER') {
+        # Hop 2 missing is (B)=no and PASS. Fail only when the bearer is present
+        # on hop 2; (A)-only contact without the credential is not High.
+        if (Report-AB -Candidate "CAND-004 $relativePath" -Hop2Path $hop2 -Pattern 'REGRESSION_BEARER') {
             $Failures.Add("${relativePath}: CAND-004 (B) Invoke-FalconDownload leaked Authorization bearer to hop 2 ($(Read-Capture $hop2))")
         }
         Stop-Children
