@@ -50,6 +50,52 @@ foreach ($RelativePath in $Scripts) {
     if ($DebugOffCommands.Count -eq 0) {
         $Failures.Add("${RelativePath}: PowerShell tracing is not disabled before credentials are processed")
     }
+
+    $AuthFunctions = $Ast.FindAll({
+        param($Node)
+        $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $Node.Name -eq 'Invoke-FalconAuth'
+    }, $true)
+    if ($AuthFunctions.Count -eq 0) {
+        $Failures.Add("${RelativePath}: Invoke-FalconAuth was not found")
+    }
+    foreach ($Function in $AuthFunctions) {
+        $TokenPosts = $Function.FindAll({
+            param($Node)
+            $Node -is [System.Management.Automation.Language.CommandAst] -and
+            $Node.GetCommandName() -eq 'Invoke-WebRequest' -and
+            $Node.Extent.Text -match 'oauth2/token'
+        }, $true)
+        if ($TokenPosts.Count -eq 0) {
+            $Failures.Add("${RelativePath}:$($Function.Extent.StartLineNumber): Invoke-FalconAuth has no oauth2/token Invoke-WebRequest")
+        }
+        foreach ($Command in $TokenPosts) {
+            if ($Command.Extent.Text -notmatch '-MaximumRedirection\s+0') {
+                $Failures.Add("${RelativePath}:$($Command.Extent.StartLineNumber): Invoke-FalconAuth oauth POST is missing -MaximumRedirection 0")
+            }
+        }
+    }
+
+    $DownloadFunctions = $Ast.FindAll({
+        param($Node)
+        $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $Node.Name -eq 'Invoke-FalconDownload'
+    }, $true)
+    foreach ($Function in $DownloadFunctions) {
+        $Downloads = $Function.FindAll({
+            param($Node)
+            $Node -is [System.Management.Automation.Language.CommandAst] -and
+            $Node.GetCommandName() -eq 'Invoke-WebRequest'
+        }, $true)
+        if ($Downloads.Count -eq 0) {
+            $Failures.Add("${RelativePath}:$($Function.Extent.StartLineNumber): Invoke-FalconDownload has no Invoke-WebRequest")
+        }
+        foreach ($Command in $Downloads) {
+            if ($Command.Extent.Text -notmatch '-MaximumRedirection\s+0') {
+                $Failures.Add("${RelativePath}:$($Command.Extent.StartLineNumber): Invoke-FalconDownload is missing -MaximumRedirection 0")
+            }
+        }
+    }
 }
 
 if ($Failures.Count -gt 0) {

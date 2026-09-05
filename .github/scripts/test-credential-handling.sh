@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Credential-handling regressions for the shipped bash helpers.
+# curl_command() pins are necessary but not sufficient: get_oauth_token and
+# fetch_tags issue their own curl invocations. Those call sites must also
+# pass --proto/--proto-redir. The previous harness only extracted
+# curl_command(), so it PASSed when oauth proto pins were missing (fail-open).
+
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -91,6 +97,195 @@ test_curl_helper bash/install/falcon-linux-install.sh global
 test_curl_helper bash/install/falcon-linux-uninstall.sh global
 test_curl_helper bash/migrate/falcon-linux-migrate.sh global
 
+# CAND-010: curl_command() already pins --proto/--proto-redir. The OAuth token
+# POST and fetch_tags() registry login are separate curl invocations. The
+# previous harness never extracted those call sites, so the suite PASSed when
+# their proto pins were missing (fail-open). Deleting oauth proto pins, or
+# leaving that equivalent gap, must now fail this script.
+
+assert_proto_pins() {
+    local description=$1 args_file=$2
+    grep -qF -- '--proto' "$args_file" ||
+        fail "$description did not restrict the request protocol (--proto)"
+    grep -qF -- '--proto-redir' "$args_file" ||
+        fail "$description did not restrict the redirect protocol (--proto-redir)"
+}
+
+# Prove the pin assertion itself is fail-closed: an argv without proto pins
+# must not be reported as a pass.
+{
+    printf '%s\n' -X POST -s -L --data '@-' >"$work_dir/unpinned-argv"
+    if (assert_proto_pins 'control: unpinned oauth argv' "$work_dir/unpinned-argv") 2>/dev/null; then
+        fail 'CAND-010 bar is fail-open: unpinned oauth argv was accepted'
+    fi
+}
+
+record_oauth_curl_args() {
+    local script=$1
+    local helper args_file stdin_file
+
+    args_file="$work_dir/oauth-args"
+    stdin_file="$work_dir/oauth-stdin"
+    : >"$args_file"
+    : >"$stdin_file"
+
+    helper=$(awk '/^get_oauth_token\(\)/,/^}/' "$repo_root/$script")
+    [ -n "$helper" ] || fail "get_oauth_token not found in $script"
+
+    (
+        curl() {
+            printf '%s\n' "$@" >"$args_file"
+            cat >"$stdin_file"
+            prev=""
+            for arg in "$@"; do
+                if [ "$prev" = "--dump-header" ]; then
+                    printf 'x-cs-region: us-1\r\n' >"$arg"
+                fi
+                prev=$arg
+            done
+            echo '{"access_token":"mock-access-token"}'
+        }
+        get_falcon_credentials() {
+            cs_falcon_client_id="regression-client-id"
+            cs_falcon_client_secret="REGRESSION_SECRET"
+            cs_falcon_member_cid=""
+        }
+        cs_cloud() { echo "api.example.invalid"; }
+        get_user_agent() { echo "crowdstrike-falcon-scripts/test"; }
+        handle_curl_error() { :; }
+        json_value() { cat >/dev/null; echo "mock-access-token"; }
+        die() { echo "die: $*" >&2; exit 1; }
+        proxy=""
+        response_headers="$work_dir/oauth-headers"
+        printf 'x-cs-region: us-1\r\n' >"$response_headers"
+        FALCON_ACCESS_TOKEN=""
+        FALCON_CLOUD=us-1
+        eval "$helper"
+        get_oauth_token
+    )
+
+    [ -s "$args_file" ] || fail "$script get_oauth_token never invoked curl"
+    grep -qF 'REGRESSION_SECRET' "$stdin_file" ||
+        fail "$script get_oauth_token did not send the client secret on curl stdin"
+    grep -qF 'oauth2/token' "$args_file" ||
+        fail "$script get_oauth_token did not request oauth2/token"
+}
+
+record_container_oauth_curl_args() {
+    local script=$1
+    local block args_file stdin_file
+
+    args_file="$work_dir/oauth-args"
+    stdin_file="$work_dir/oauth-stdin"
+    : >"$args_file"
+    : >"$stdin_file"
+
+    block=$(awk '
+        /token_result=\$\(echo "client_id=\$FALCON_CLIENT_ID/ { p = 1 }
+        p { print }
+        /handle_curl_error \$\?/ { if (p) exit }
+    ' "$repo_root/$script")
+    [ -n "$block" ] || fail "oauth token curl block not found in $script"
+
+    (
+        curl() {
+            printf '%s\n' "$@" >"$args_file"
+            cat >"$stdin_file"
+            prev=""
+            for arg in "$@"; do
+                if [ "$prev" = "--dump-header" ]; then
+                    printf 'x-cs-region: us-1\r\n' >"$arg"
+                fi
+                prev=$arg
+            done
+            echo '{"access_token":"mock-access-token"}'
+        }
+        cs_cloud() { echo "api.example.invalid"; }
+        handle_curl_error() { :; }
+        FALCON_CLIENT_ID="regression-client-id"
+        FALCON_CLIENT_SECRET="REGRESSION_SECRET"
+        VERSION="test"
+        response_headers="$work_dir/oauth-headers"
+        : >"$response_headers"
+        eval "$block"
+    )
+
+    [ -s "$args_file" ] || fail "$script oauth block never invoked curl"
+    grep -qF 'REGRESSION_SECRET' "$stdin_file" ||
+        fail "$script oauth block did not send the client secret on curl stdin"
+    grep -qF 'oauth2/token' "$args_file" ||
+        fail "$script oauth block did not request oauth2/token"
+}
+
+pin_failures=0
+
+check_proto_pins() {
+    local description=$1 args_file=$2
+    if ! grep -qF -- '--proto' "$args_file"; then
+        echo "FAIL: $description did not restrict the request protocol (--proto)" >&2
+        pin_failures=$((pin_failures + 1))
+    fi
+    if ! grep -qF -- '--proto-redir' "$args_file"; then
+        echo "FAIL: $description did not restrict the redirect protocol (--proto-redir)" >&2
+        pin_failures=$((pin_failures + 1))
+    fi
+}
+
+test_oauth_token_curl_pins() {
+    local script=$1
+    record_oauth_curl_args "$script"
+    check_proto_pins "$script get_oauth_token oauth POST" "$work_dir/oauth-args"
+}
+
+test_oauth_token_curl_pins bash/install/falcon-linux-install.sh
+test_oauth_token_curl_pins bash/install/falcon-linux-uninstall.sh
+test_oauth_token_curl_pins bash/migrate/falcon-linux-migrate.sh
+record_container_oauth_curl_args \
+    bash/containers/falcon-container-sensor-pull/falcon-container-sensor-pull.sh
+check_proto_pins \
+    'falcon-container-sensor-pull.sh oauth POST' \
+    "$work_dir/oauth-args"
+
+test_fetch_tags_curl_pins() {
+    local script=$1
+    local helper args_file stdin_file
+
+    helper=$(awk '/^fetch_tags\(\)/,/^}/' "$repo_root/$script")
+    [ -n "$helper" ] || fail "fetch_tags not found in $script"
+
+    args_file="$work_dir/fetch-tags-args"
+    stdin_file="$work_dir/fetch-tags-stdin"
+    : >"$args_file"
+    : >"$stdin_file"
+
+    (
+        curl() {
+            printf '%s\n' "$@" >"$args_file"
+            cat >"$stdin_file"
+            echo '{"token":"mock-registry-token"}'
+        }
+        curl_command() { echo '{"tags":[]}'; }
+        handle_curl_error() { :; }
+        json_value() { cat >/dev/null; echo "mock-registry-token"; }
+        die() { echo "die: $*" >&2; exit 1; }
+        ART_USERNAME="user"
+        ART_PASSWORD="REGRESSION_BASIC"
+        cs_registry="registry.example.invalid"
+        registry_opts="ns"
+        repository_name="repo"
+        eval "$helper"
+        fetch_tags >/dev/null
+    )
+
+    [ -s "$args_file" ] || fail "$script fetch_tags never invoked curl"
+    grep -qF 'REGRESSION_BASIC' "$stdin_file" ||
+        fail "$script fetch_tags did not pass registry credentials on curl stdin"
+    check_proto_pins "$script fetch_tags registry login" "$args_file"
+}
+
+test_fetch_tags_curl_pins \
+    bash/containers/falcon-container-sensor-pull/falcon-container-sensor-pull.sh
+
 test_xtrace_guard() {
     local script=$1 guard trace_file
 
@@ -163,5 +358,9 @@ assert_no_match \
     'a PowerShell log statement exposes an authentication or installer token' \
     '(Invoke-FalconAuth|GetToken) - \$content:|Retrieved maintenance token:|Starting .*parameters.*\$(Install|Uninstall)Params' \
     powershell '*.ps1'
+
+if [ "$pin_failures" -ne 0 ]; then
+    fail "$pin_failures shipped oauth/fetch_tags curl invocation(s) are missing --proto/--proto-redir"
+fi
 
 echo 'PASS: credential handling regression checks'
