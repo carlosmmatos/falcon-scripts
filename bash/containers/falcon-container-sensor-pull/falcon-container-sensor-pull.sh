@@ -324,8 +324,13 @@ curl_command() {
 }
 
 fetch_tags() {
+    # Registry login carries Basic auth via -K-. Pin the scheme to https and do
+    # not follow redirects (-L removed): an https→https redirect defeats
+    # --proto-redir '=https', so following one could contact a second hop
+    # (CAND-002 A). The token endpoint does not legitimately redirect.
     bearer_result=$(echo "-u $ART_USERNAME:$ART_PASSWORD" |
-        curl -s -L "https://$cs_registry/v2/token?account=$ART_USERNAME&scope=repository:$registry_opts/$repository_name:pull&service=$cs_registry" -K-)
+        curl -s --proto '=https' --proto-redir '=https' \
+            "https://$cs_registry/v2/token?account=$ART_USERNAME&scope=repository:$registry_opts/$repository_name:pull&service=$cs_registry" -K-)
     handle_curl_error $?
     registry_bearer=$(echo "$bearer_result" | json_value "token" | sed 's/ *$//g' | sed 's/^ *//g')
     # Check if registry_bearer is not empty
