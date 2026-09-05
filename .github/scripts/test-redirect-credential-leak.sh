@@ -5,6 +5,10 @@
 # CAND-002 logs (A) hop-2 contact vs (B) Basic/credential on hop 2; only (B)
 # fails this script as a credential leak. The mock is fail-closed: an unpinned
 # control POST must leak, or later "no leak" results are meaningless.
+#
+# OAuth POSTs must also omit -L/--location: curl replays the credential body on
+# a 307/308 follow, and an https→https redirect defeats --proto-redir '=https'.
+# Hop 2 missing is a PASS for CAND-001 (expected when follow is disabled).
 
 set -euo pipefail
 
@@ -266,6 +270,24 @@ record_oauth_from_container() {
 
 oauth_failures=0
 
+# Standalone -L/--location on the shipped oauth POST argv would follow a
+# 307/308 and replay the client secret. Reject those flags before the live
+# replay so reintroducing follow fails closed even if hop-2 capture softens.
+assert_oauth_post_no_follow() {
+    local script=$1
+    local arg
+
+    while IFS= read -r arg; do
+        case $arg in
+            -L | --location | --location-trusted)
+                echo "FAIL: $script oauth POST still follows redirects ($arg)" >&2
+                return 1
+                ;;
+        esac
+    done <"$work_dir/oauth-args"
+    return 0
+}
+
 test_shipped_oauth_redirect() {
     local script=$1
     local mode=$2
@@ -280,6 +302,10 @@ test_shipped_oauth_redirect() {
     tr '\n' ' ' <"$work_dir/oauth-args"
     echo
 
+    if ! assert_oauth_post_no_follow "$script"; then
+        oauth_failures=$((oauth_failures + 1))
+    fi
+
     start_redirect_pair "$work_dir/oa1" "$work_dir/oa2" "/oauth2/token" https
     replay_recorded_curl \
         "$work_dir/oauth-args" \
@@ -287,6 +313,14 @@ test_shipped_oauth_redirect() {
         "https://127.0.0.1:$(cat "$work_dir/oa1.port")/oauth2/token"
     echo "hop1 capture ($script): $(cat "$work_dir/oa1" 2>/dev/null || echo '<missing>')"
     echo "hop2 capture ($script): $(cat "$work_dir/oa2" 2>/dev/null || echo '<missing>')"
+
+    # Harness integrity: the recorded request must actually hit hop 1 with the
+    # secret, or a later hop-2-empty PASS would be meaningless (fail-open).
+    if ! [ -s "$work_dir/oa1" ] || ! grep -qF 'REGRESSION_SECRET' "$work_dir/oa1"; then
+        echo "FAIL: $script oauth POST never delivered REGRESSION_SECRET to hop 1" >&2
+        oauth_failures=$((oauth_failures + 1))
+    fi
+
     if report_ab "CAND-001 $script" "$work_dir/oa2" 'REGRESSION_SECRET'; then
         echo "FAIL: $script oauth POST HTTPS→HTTPS 307 (B) body secret on hop 2" >&2
         oauth_failures=$((oauth_failures + 1))
