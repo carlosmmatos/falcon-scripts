@@ -712,8 +712,12 @@ cs_falcon_oauth_token=$(
         die "The 'curl' command is missing. Please install it before continuing. Aborting..."
     fi
 
+    # This POST body carries the client secret. Pin the scheme to https and do
+    # not follow redirects (-L removed): curl replays the request body on a
+    # 307/308 redirect, so following one could leak the secret to a redirect
+    # target. The token endpoint never legitimately redirects.
     token_result=$(echo "client_id=$FALCON_CLIENT_ID&client_secret=$FALCON_CLIENT_SECRET" |
-        curl -X POST -s -L "https://$(cs_cloud)/oauth2/token" \
+        curl -X POST -s --proto '=https' --proto-redir '=https' "https://$(cs_cloud)/oauth2/token" \
             -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
             -H "User-Agent: crowdstrike-falcon-script/$VERSION" \
             --dump-header "$response_headers" \
