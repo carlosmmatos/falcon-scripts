@@ -31,14 +31,8 @@ jobs:
           zip -r ../../systemd_podman.zip *
           popd
 
-          # Create a list of files to upload. Restrict the search to the
-          # directories that hold shipped artifacts, so CI helper scripts under
-          # .github/scripts and unit tests under bash/**/test/ stay out of the
-          # release assets and out of checksum.txt.
-          list_of_files=$(
-            find ./bash ./powershell ./systemd -type f \( -name "*.sh" -o -name "*.ps1" \) -not -path '*/test/*'
-            find . -maxdepth 1 -type f -name "*.zip"
-          )
+          # Create a list of files to upload
+          list_of_files=$(find . -type f \( -name "*.sh" -o -name "*.ps1" -o -name "*.zip" \))
 
           # Create checksum.txt
           for file in $list_of_files; do
