@@ -131,7 +131,7 @@ Other Options
         Accepted values are [us-1|us-2|us-3|eu-1|us-gov-1|us-gov-2].
 
     - ALLOW_LEGACY_CURL                 (default: false)
-        To continue on a version of curl older than 7.33.0.
+        Deprecated. Accepted and ignored; no longer needed.
 
     - USER_AGENT                        (default: unset)
         User agent string to append to the User-Agent header when making
@@ -222,48 +222,18 @@ if ! command -v curl >/dev/null 2>&1; then
     die "The 'curl' command is missing. Please install it before continuing. Aborting..."
 fi
 
-# curl 7.33.0 added the oauth2-bearer option. Older versions ignore the option
-# without an error, which sends the request with no credential at all.
-curl_has_oauth2_bearer=$(
-    version=$(curl --version | head -n 1 | awk '{ print $2 }')
-    minimum="7.33"
-
-    # sort -C succeeds when the input is already in order, so print the minimum
-    # first. The check then also accepts a version equal to the minimum.
-    if printf "%s\n" "$minimum" "$version" | sort -V -C; then
-        echo 1
-    else
-        echo 0
-    fi
-)
-
-if [ "$curl_has_oauth2_bearer" -eq 0 ]; then
-    if [ "${ALLOW_LEGACY_CURL:-false}" != "true" ]; then
-        echo """
-WARNING: Your version of curl is older than 7.33.0 and cannot use the
-oauth2-bearer option. The script can instead send the credential as a raw
-Authorization header. The credential still travels on the curl configuration
-input and stays off the command line either way.
-
-What is not verified on curl this old is redirect handling: the script cannot
-confirm that your curl removes the credential when a redirect crosses to
-another host. The script restricts every request and redirect to HTTPS, so the
-credential can only ever go to an HTTPS host.
-
-To accept this and continue, set the environment variable ALLOW_LEGACY_CURL=true
-"""
-        exit 1
-    fi
+if [ "${ALLOW_LEGACY_CURL:-false}" = "true" ]; then
+    echo "NOTICE: ALLOW_LEGACY_CURL is no longer needed and is ignored." >&2
 fi
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    local auth_config
-    if [ "$curl_has_oauth2_bearer" -eq 1 ]; then
-        auth_config=$(printf 'oauth2-bearer = "%s"' "$cs_falcon_oauth_token")
-    else
-        auth_config=$(printf 'header = "Authorization: Bearer %s"' "$cs_falcon_oauth_token")
-    fi
+    local escaped_token auth_config
+    # The configuration value must be quoted, because it holds a space and a
+    # colon. curl processes backslash escapes inside a quoted value, so a
+    # backslash or a double quote in the token has to be escaped first.
+    escaped_token=$(printf '%s' "$cs_falcon_oauth_token" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    auth_config=$(printf 'header = "Authorization: Bearer %s"' "$escaped_token")
     printf '%s\n' "$auth_config" |
         curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
@@ -641,13 +611,26 @@ cs_sensor_policy_version() {
     IFS=$oldIFS
 }
 
+# Compare the downloaded installer against the SHA-256 that the API supplied.
+# That digest is the download id in the request URL, so this check finds
+# truncation and alteration in transit. It is not a signature check: the digest
+# and the file come from the same response, so it does not prove who built the
+# installer.
 verify_sha256() {
     local file="$1" expected_sha="$2" local_sha
 
     if command -v sha256sum >/dev/null 2>&1; then
         local_sha=$(sha256sum "$file" | awk '{ print $1 }')
-    else
+    elif command -v openssl >/dev/null 2>&1; then
         local_sha=$(openssl dgst -sha256 "$file" | awk '{ print $NF }')
+    else
+        # Keep the file. The download is not known to be bad, only unverified.
+        die "Cannot verify the downloaded sensor installer: neither 'sha256sum' nor 'openssl' is available. Install one of them and try again. The download is kept at $file."
+        # die exits, so shellcheck reports the return below as unreachable and
+        # it is. Keep it anyway: if die ever stops exiting, control would reach
+        # the comparison with an empty digest and delete the file.
+        # shellcheck disable=SC2317
+        return 1
     fi
     if [ "$local_sha" != "$expected_sha" ]; then
         rm -f "$file"

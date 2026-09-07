@@ -7,11 +7,9 @@ environment variable. Consult the Environment Variables for each script for more
 
 ## Security Recommendations
 
-### Use cURL version 7.33.0 or newer
+### Credential handling
 
-OAuth credentials go to cURL through its configuration input instead of command-line arguments, so the credential never appears in the process list. cURL 7.33.0 and newer accept the credential as an OAuth 2 bearer token, which also lets cURL remove the credential when a redirect crosses to another host. On older cURL the script can send the same credential as a raw `Authorization` header — still through the configuration input, still off the command line — but it cannot confirm the redirect behavior of a cURL that old. The script restricts every request and redirect to HTTPS. To accept this and continue on an older cURL, set `ALLOW_LEGACY_CURL=true`.
-
-To check your version of cURL, run the following command: `curl --version`
+Credentials travel on cURL's configuration input rather than the command line, and every request and redirect is restricted to HTTPS. This works with the cURL that RHEL and CentOS 7 ship, and with current cURL.
 
 ## Table of Contents
 
@@ -182,7 +180,7 @@ Other Options
         The path to download the falcon sensor to.
 
     - ALLOW_LEGACY_CURL                 (default: false)
-        To continue on a version of curl older than 7.33.0.
+        Deprecated. Accepted and ignored; no longer needed.
 
     - GET_ACCESS_TOKEN                  (default: false)
         Prints an access token and exits.
