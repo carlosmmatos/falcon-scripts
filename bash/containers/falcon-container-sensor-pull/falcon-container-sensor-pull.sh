@@ -12,6 +12,41 @@ unset FALCON_CLIENT_SECRET
 FALCON_CLIENT_SECRET=$falcon_client_secret
 unset falcon_client_secret
 
+# Opt-in redacted debug. Never re-enable set -x around credential paths.
+falcon_debug_enabled() {
+    case "${FALCON_DEBUG:-}" in
+        1 | true | TRUE | yes | YES | on | ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+falcon_debug_scrub() {
+    # Deny-list: secrets must never appear in debug output.
+    printf '%s' "$1" | sed \
+        -e 's/[Cc]lient_[Ss]ecret[=:][^[:space:]&"]*/client_secret=[REDACTED]/g' \
+        -e 's/[Aa]ccess_[Tt]oken[=:][^[:space:]&"]*/access_token=[REDACTED]/g' \
+        -e 's/[Rr]efresh_[Tt]oken[=:][^[:space:]&"]*/refresh_token=[REDACTED]/g' \
+        -e 's/[Pp]rovisioning_[Tt]oken[=:][^[:space:]&"]*/provisioning_token=[REDACTED]/g' \
+        -e 's/[Mm]aintenance_[Tt]oken[=:][^[:space:]&"]*/maintenance_token=[REDACTED]/g' \
+        -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]"]*/Authorization:[REDACTED]/g' \
+        -e 's/[Bb]earer[[:space:]][^[:space:]]*/Bearer [REDACTED]/g' \
+        -e 's/[Bb]asic[[:space:]][^[:space:]]*/Basic [REDACTED]/g' \
+        -e 's/header[[:space:]]*=[[:space:]]*"Authorization:[^"]*"/header = "Authorization:[REDACTED]"/g' \
+        -e 's/[Oo][Ll][Dd]_FALCON_CLIENT_SECRET[=:][^[:space:]&"]*/OLD_FALCON_CLIENT_SECRET=[REDACTED]/g' \
+        -e 's/[Nn][Ee][Ww]_FALCON_CLIENT_SECRET[=:][^[:space:]&"]*/NEW_FALCON_CLIENT_SECRET=[REDACTED]/g'
+}
+
+falcon_debug() {
+    falcon_debug_enabled || return 0
+    printf 'FALCON_DEBUG: %s\n' "$(falcon_debug_scrub "$*")" >&2
+}
+
+falcon_debug_http_status() {
+    # Last HTTP status from a curl --dump-header file. Status only — no header dump.
+    [ -f "$1" ] || return 0
+    grep -i '^HTTP/' "$1" 2>/dev/null | tail -n 1 | awk '{print $2}'
+}
+
 : <<'#DESCRIPTION#'
 File: falcon-container-sensor-pull.sh
 Description: Bash script to copy Falcon DaemonSet Sensor, Container Sensor, or Kubernetes Admission Controller images from CrowdStrike Container Registry.
@@ -72,6 +107,9 @@ Optional Flags:
     --get-cid                                      Get the CID assigned to the API Credentials
     --list-tags                                    List all tags available for the selected sensor type and platform, sorted in ascending order
     --allow-legacy-curl                            Deprecated. Accepted and ignored; no longer needed
+    --debug                                        Enable redacted debug markers (or set FALCON_DEBUG=1).
+                                                   Prints step, HTTP status, cloud/region, and curl exit only.
+                                                   Never prints secrets. Do not use bash -x for support.
 
 Internal Flags:
     --internal-build-stage <BUILD_STAGE>           (Internal only) Falcon Build Stage [release|stage] (Default: release)
@@ -200,6 +238,9 @@ while [ $# != 0 ]; do
                 ALLOW_LEGACY_CURL=true
             fi
             ;;
+        --debug)
+            FALCON_DEBUG=1
+            ;;
         -n | --node)
             if [ -n "${1}" ]; then
                 deprecated "-n|--node"
@@ -252,6 +293,7 @@ fi
 # Handle error codes returned by curl
 handle_curl_error() {
     local err_msg
+    falcon_debug "handle_curl_error curl_exit=$1"
 
     if [ "$1" = "28" ]; then
         err_msg="Operation timed out (exit code 28). If using a proxy, please check your proxy settings."
@@ -282,13 +324,25 @@ handle_curl_error() {
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    local token="$1" escaped_token auth_config
+    local token="$1" escaped_token auth_config curl_rc
     shift
     # The configuration value must be quoted, because it holds a space and a
     # colon. curl processes backslash escapes inside a quoted value, so a
     # backslash or a double quote in the token has to be escaped first.
     escaped_token=$(printf '%s' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     auth_config=$(printf 'header = "Authorization: Bearer %s"' "$escaped_token")
+    if falcon_debug_enabled; then
+        local body_file http_code
+        body_file=$(mktemp)
+        http_code=$(printf '%s\n' "$auth_config" |
+            curl -s -L --proto '=https' --proto-redir '=https' -K- \
+                -o "$body_file" -w '%{http_code}' "$@") || curl_rc=$?
+        curl_rc=${curl_rc:-0}
+        falcon_debug "curl_command http_status=${http_code:-unknown} curl_exit=${curl_rc}"
+        cat "$body_file"
+        rm -f "$body_file"
+        return "$curl_rc"
+    fi
     printf '%s\n' "$auth_config" |
         curl -s -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
@@ -298,6 +352,7 @@ fetch_tags() {
     # not follow redirects (-L removed): an https→https redirect defeats
     # --proto-redir '=https', so following one could contact a second hop
     # (CAND-002 A). The token endpoint does not legitimately redirect.
+    falcon_debug "fetch_tags step=registry_token"
     bearer_result=$(echo "-u $ART_USERNAME:$ART_PASSWORD" |
         curl -s --proto '=https' --proto-redir '=https' \
             "https://$cs_registry/v2/token?account=$ART_USERNAME&scope=repository:$registry_opts/$repository_name:pull&service=$cs_registry" -K-)
@@ -681,6 +736,8 @@ VARIABLES="FALCON_CLIENT_ID FALCON_CLIENT_SECRET"
     [ -n "$VAR_UNSET" ] && usage
 }
 
+falcon_debug "start version=$VERSION cloud=${FALCON_CLOUD:-unset} sensor_type=${SENSOR_TYPE:-unset}"
+
 response_headers=$(mktemp)
 cs_falcon_oauth_token=$(
     if ! command -v curl >/dev/null 2>&1; then
@@ -691,13 +748,17 @@ cs_falcon_oauth_token=$(
     # not follow redirects (-L removed): curl replays the request body on a
     # 307/308 redirect, so following one could leak the secret to a redirect
     # target. The token endpoint never legitimately redirects.
+    falcon_debug "oauth2_token step=request cloud=${FALCON_CLOUD:-unset}"
     token_result=$(echo "client_id=$FALCON_CLIENT_ID&client_secret=$FALCON_CLIENT_SECRET" |
         curl -X POST -s --proto '=https' --proto-redir '=https' "https://$(cs_cloud)/oauth2/token" \
             -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
             -H "User-Agent: crowdstrike-falcon-script/$VERSION" \
             --dump-header "$response_headers" \
             --data @-)
-    handle_curl_error $?
+    oauth_curl_rc=$?
+    oauth_http_status=$(falcon_debug_http_status "$response_headers")
+    falcon_debug "oauth2_token step=response http_status=${oauth_http_status:-unknown} curl_exit=${oauth_curl_rc} cloud=${FALCON_CLOUD:-unset}"
+    handle_curl_error "$oauth_curl_rc"
     token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
     if [ -z "$token" ]; then
         die "Unable to obtain CrowdStrike Falcon OAuth Token. Double check your credentials and/or ensure you set the correct cloud region."
@@ -706,6 +767,7 @@ cs_falcon_oauth_token=$(
 )
 
 region_hint=$(grep -i ^x-cs-region: "$response_headers" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
+falcon_debug "oauth2_token region_hint=${region_hint:-none} cloud=${FALCON_CLOUD:-unset}"
 rm "${response_headers}"
 
 if [ "${FALCON_CLOUD}" != "${region_hint}" ] && [ -n "${region_hint}" ]; then

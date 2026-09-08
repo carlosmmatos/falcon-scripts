@@ -79,7 +79,7 @@ export [OLD|NEW]FALCON_CLOUD="us-gov-1"
 ## Usage
 
 ```terminal
-Usage: falcon-linux-migrate.sh [-h|--help]
+Usage: falcon-linux-migrate.sh [-h|--help|--debug]
 
 Migrates the Falcon sensor to another Falcon CID.
 Version: 1.13.0
@@ -188,9 +188,17 @@ Other Options
         User agent string to append to the User-Agent header when making
         requests to the CrowdStrike API.
 
-This script recognizes the following argument:
+    - FALCON_DEBUG                      (default: unset)
+        Enable redacted debug markers (step name, HTTP status, cloud/region,
+        curl exit). Never prints secrets. Do not use bash -x for support.
+        Applies the same deny-list to OLD_ and NEW_ credentials.
+        Accepted values are ['1', 'true'].
+
+This script recognizes the following arguments:
     -h, --help
         Print this help message and exit.
+    --debug
+        Same as FALCON_DEBUG=1.
 ```
 
 ### Examples
@@ -246,17 +254,16 @@ curl -L https://raw.githubusercontent.com/crowdstrike/falcon-scripts/v1.13.0/bas
 
 ## Troubleshooting
 
-To troubleshoot migration issues, you can run the script with `bash -x` for detailed output:
+Use the redacted debug mode for support. It prints step names, HTTP status, cloud/region, and curl exit codes only — never secrets, including OLD_ and NEW_ credentials.
 
 ```bash
-bash -x falcon-linux-migrate.sh
+export FALCON_DEBUG=1
+sudo bash falcon-linux-migrate.sh
+# or
+sudo bash falcon-linux-migrate.sh --debug
 ```
 
-or
-
-```bash
-curl -L https://raw.githubusercontent.com/crowdstrike/falcon-scripts/v1.13.0/bash/migrate/falcon-linux-migrate.sh | bash -x
-```
+Do **not** run this script under `bash -x` for support. Shell tracing is forced off at startup to keep credentials out of logs. `bash -x` / `set -x` can leak `client_secret`, tokens, `Authorization` headers, and oauth POST bodies.
 
 The script creates a log file at the location specified by `LOG_PATH` (defaults to `/tmp`) with the name format `falcon_migration_YYYYMMDD_HHMMSS.log`. This log contains detailed information about each step of the migration process.
 

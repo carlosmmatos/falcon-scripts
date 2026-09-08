@@ -135,6 +135,9 @@ Optional Flags:
     --get-cid                                      Get the CID assigned to the API Credentials
     --list-tags                                    List all tags available for the selected sensor type and platform, sorted in ascending order
     --allow-legacy-curl                            Deprecated. Accepted and ignored; no longer needed
+    --debug                                        Enable redacted debug markers (or set FALCON_DEBUG=1).
+                                                   Prints step, HTTP status, cloud/region, and curl exit only.
+                                                   Never prints secrets. Do not use bash -x for support.
 
 Internal Flags:
     --internal-build-stage <BUILD_STAGE>           (Internal only) Falcon Build Stage [release|stage] (Default: release)
@@ -166,6 +169,7 @@ Help Options:
 | `--get-cid`                                    | N/A                     | `None`                        | Get the CID assigned to the API Credentials.                                                                                                                                                                                                             |
 | `--list-tags`                                  | `$LISTTAGS`             | `False` (Optional)            | List all tags available for the selected sensor                                                                                                                                                                                                          |
 | `--allow-legacy-curl`                          | `$ALLOW_LEGACY_CURL`    | `False` (Optional)            | Deprecated. Accepted and ignored; no longer needed                                                                                                                                                                                                       |
+| `--debug`                                      | `$FALCON_DEBUG`         | `unset` (Optional)            | Enable redacted debug markers (step, HTTP status, cloud/region, curl exit). Never prints secrets. Do not use `bash -x` for support.                                                                                                                      |
 | `-h`, `--help`                                 | N/A                     | `None`                        | Display help message                                                                                                                                                                                                                                     |
 
 ---
@@ -438,3 +442,16 @@ The following example will pull the `falcon-sensor` image for the `x86_64` platf
 --type falcon-sensor \
 --platform x86_64
 ```
+
+## Troubleshooting
+
+Use the redacted debug mode for support. It prints step names, HTTP status, cloud/region, and curl exit codes only — never secrets.
+
+```bash
+export FALCON_DEBUG=1
+./falcon-container-sensor-pull.sh --client-id <FALCON_CLIENT_ID> --client-secret <FALCON_CLIENT_SECRET>
+# or
+./falcon-container-sensor-pull.sh --debug --client-id <FALCON_CLIENT_ID> --client-secret <FALCON_CLIENT_SECRET>
+```
+
+Do **not** run this script under `bash -x` for support. Shell tracing is forced off at startup to keep credentials out of logs. `bash -x` / `set -x` can leak `client_secret`, tokens, `Authorization` headers, oauth POST bodies, and `-K-` config lines.
