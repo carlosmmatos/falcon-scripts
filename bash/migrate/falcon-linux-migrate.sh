@@ -291,14 +291,16 @@ check_package_manager_lock() {
 }
 
 cs_cloud() {
-    case "${cs_falcon_cloud}" in
+    # $1 optionally overrides cs_falcon_cloud, used by the OAuth region retry.
+    local region="${1:-$cs_falcon_cloud}"
+    case "${region}" in
         us-1) echo "api.crowdstrike.com" ;;
         us-2) echo "api.us-2.crowdstrike.com" ;;
         us-3) echo "api.us-3.crowdstrike.com" ;;
         eu-1) echo "api.eu-1.crowdstrike.com" ;;
         us-gov-1) echo "api.laggar.gcw.crowdstrike.com" ;;
         us-gov-2) echo "api.us-gov-2.crowdstrike.mil" ;;
-        *) die "Unrecognized Falcon Cloud: ${cs_falcon_cloud}" ;;
+        *) die "Unrecognized Falcon Cloud: ${region}" ;;
     esac
 }
 
@@ -342,6 +344,15 @@ get_user_agent() {
     echo "$user_agent"
 }
 
+# POSTs the OAuth payload from stdin, never argv. $1 = API host, $2 = header dump path.
+oauth_token_request() {
+    curl -X POST -s -x "$proxy" --proto '=https' "https://$1/oauth2/token" \
+        -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+        -H "User-Agent: $(get_user_agent)" \
+        --dump-header "$2" \
+        --data @-
+}
+
 get_oauth_token() {
     # Get credentials first
     get_falcon_credentials
@@ -359,16 +370,30 @@ get_oauth_token() {
                 auth_payload="${auth_payload}&member_cid=${cs_falcon_member_cid}"
             fi
 
-            token_result=$(echo "$auth_payload" |
-                curl -X POST -s -x "$proxy" -L "https://$(cs_cloud)/oauth2/token" \
-                    -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
-                    -H "User-Agent: $(get_user_agent)" \
-                    --dump-header "${response_headers}" \
-                    --data @-)
+            token_result=$(echo "$auth_payload" | oauth_token_request "$(cs_cloud)" "${response_headers}")
 
             handle_curl_error $?
 
             token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
+            if [ -z "$token" ]; then
+                # Wrong region: retry against the x-cs-region hint instead of
+                # following the redirect, which would replay the secret to Location.
+                hinted=$(grep -i ^x-cs-region: "${response_headers}" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
+                if [ -n "$hinted" ] && [ "$hinted" != "$cs_falcon_cloud" ]; then
+                    # cs_cloud() validates the hint against its own allowlist. Check
+                    # for empty rather than trusting its die, which does not stop bash.
+                    retry_host=$(cs_cloud "$hinted")
+                    if [ -n "$retry_host" ]; then
+                        # Separate file: --dump-header truncates, and region_hint below
+                        # still needs the original response.
+                        retry_headers=$(mktemp)
+                        token_result=$(echo "$auth_payload" | oauth_token_request "$retry_host" "$retry_headers")
+                        handle_curl_error $?
+                        rm -f "$retry_headers"
+                        token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
+                    fi
+                fi
+            fi
             if [ -z "$token" ]; then
                 die "Unable to obtain CrowdStrike Falcon OAuth Token. Double check your credentials and/or ensure you set the correct cloud region."
             fi

@@ -192,6 +192,39 @@ begin {
         return $Output
     }
 
+    function Get-FalconRegionHeader($Response) {
+        # Reads X-Cs-Region. The header collection type differs by platform and
+        # by which code path produced it (HttpResponseHeaders vs
+        # WebHeaderCollection vs a Dictionary), so probe by type/method instead
+        # of assuming one shape.
+        if (!$Response) {
+            return $null
+        }
+        $ResponseHeaders = $Response.Headers
+        if (!$ResponseHeaders) {
+            return $null
+        }
+        if ($ResponseHeaders -is [System.Net.WebHeaderCollection]) {
+            return $ResponseHeaders['X-Cs-Region']
+        }
+        $HeaderMethods = @($ResponseHeaders.PSObject.Methods.Name)
+        # ContainsKey first: HttpResponseHeaders lacks it, so this can't misfire
+        # on PowerShell 7.
+        if ($HeaderMethods -contains 'ContainsKey') {
+            if ($ResponseHeaders.ContainsKey('X-Cs-Region')) {
+                return @($ResponseHeaders['X-Cs-Region'])[0]
+            }
+            return $null
+        }
+        if ($HeaderMethods -contains 'Contains') {
+            if ($ResponseHeaders.Contains('X-Cs-Region')) {
+                return @($ResponseHeaders.GetValues('X-Cs-Region'))[0]
+            }
+            return $null
+        }
+        return $null
+    }
+
     function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [hashtable] $Body, [string] $FalconCloud) {
         $Headers = @{'Accept' = 'application/json'; 'Content-Type' = 'application/x-www-form-urlencoded'; 'charset' = 'utf-8' }
         $Headers.Add('User-Agent', $FullUserAgent)
@@ -199,16 +232,28 @@ begin {
             $Headers.Add('Authorization', "bearer $($FalconAccessToken)")
         }
         else {
+            # A 3xx here is the region auto-discovery hint (X-Cs-Region), not an
+            # error. -MaximumRedirection 0 blocks it because 307/308 replay the
+            # secret in the body. PowerShell 7 throws it; Windows PowerShell 5.1
+            # returns it, and both funnel into $RedirectResponse and are handled once
+            # below.
+            $RedirectResponse = $null
             try {
-                $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body
-                $content = ConvertFrom-Json -InputObject $response.Content
+                $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body -MaximumRedirection 0
 
-                if ([string]::IsNullOrEmpty($content.access_token)) {
-                    $Message = 'Unable to authenticate to the CrowdStrike Falcon API. Please check your credentials and try again.'
-                    throw $Message
+                if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
+                    $RedirectResponse = $response
                 }
+                else {
+                    $content = ConvertFrom-Json -InputObject $response.Content
 
-                $Headers.Add('Authorization', "bearer $($content.access_token)")
+                    if ([string]::IsNullOrEmpty($content.access_token)) {
+                        $Message = 'Unable to authenticate to the CrowdStrike Falcon API. Please check your credentials and try again.'
+                        throw $Message
+                    }
+
+                    $Headers.Add('Authorization', "bearer $($content.access_token)")
+                }
             }
             catch {
                 # Handle redirects
@@ -221,34 +266,36 @@ begin {
                     throw $Message
                 }
 
-                if ($response.StatusCode -in @(301, 302, 303, 307, 308)) {
-                    # If autodiscover is enabled, try to get the correct cloud
-                    if ($FalconCloud -eq 'autodiscover') {
-                        if ($response.Headers.Contains('X-Cs-Region')) {
-                            $region = $response.Headers.GetValues('X-Cs-Region')[0]
-                            Write-Verbose "Received a redirect to $region. Setting FalconCloud to $region"
-                        }
-                        else {
-                            $Message = 'Received a redirect but no X-Cs-Region header was provided. Unable to autodiscover the FalconCloud. Please set FalconCloud to the correct region.'
-                            Write-FalconLog -Source 'Invoke-FalconAuth' -Message $Message
-                            throw $Message
-                        }
-
-                        $BaseUrl = Get-FalconCloud($region)
-                        $BaseUrl, $Headers = Invoke-FalconAuth -WebRequestParams $WebRequestParams -BaseUrl $BaseUrl -Body $Body -FalconCloud $FalconCloud
-
-                    }
-                    else {
-                        $Message = "Received a redirect. Please set FalconCloud to 'autodiscover' or the correct region."
-                        Write-FalconLog -Source 'Invoke-FalconAuth' -Message $Message
-                        throw $Message
-                    }
+                if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
+                    $RedirectResponse = $response
                 }
                 else {
                     $Message = "Received a $($response.StatusCode) response from $($BaseUrl)/oauth2/token. Please check your credentials and try again. Error: $($response.StatusDescription)"
                     Write-FalconLog -Source 'Invoke-FalconAuth' -Message $Message
                     throw $Message
                 }
+            }
+
+            if ($RedirectResponse) {
+                if ($FalconCloud -ne 'autodiscover') {
+                    $Message = "Received a redirect. Please set FalconCloud to 'autodiscover' or the correct region."
+                    Write-FalconLog -Source 'Invoke-FalconAuth' -Message $Message
+                    throw $Message
+                }
+
+                $region = Get-FalconRegionHeader -Response $RedirectResponse
+
+                if ([string]::IsNullOrEmpty($region)) {
+                    $Message = 'Received a redirect but no X-Cs-Region header was provided. Unable to autodiscover the FalconCloud. Please set FalconCloud to the correct region.'
+                    Write-FalconLog -Source 'Invoke-FalconAuth' -Message $Message
+                    throw $Message
+                }
+
+                Write-Verbose "Received a redirect to $region. Setting FalconCloud to $region"
+                # Get-FalconCloud validates the region against its own allowlist,
+                # not the Location header.
+                $BaseUrl = Get-FalconCloud($region)
+                $BaseUrl, $Headers = Invoke-FalconAuth -WebRequestParams $WebRequestParams -BaseUrl $BaseUrl -Body $Body -FalconCloud $FalconCloud
             }
         }
 

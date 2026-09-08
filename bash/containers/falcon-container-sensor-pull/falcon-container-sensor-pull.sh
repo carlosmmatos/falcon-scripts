@@ -92,14 +92,16 @@ deprecated() {
 }
 
 cs_cloud() {
-    case "${FALCON_CLOUD}" in
+    # $1 optionally overrides FALCON_CLOUD, used by the OAuth region retry.
+    local region="${1:-$FALCON_CLOUD}"
+    case "${region}" in
         us-1) echo "api.crowdstrike.com" ;;
         us-2) echo "api.us-2.crowdstrike.com" ;;
         us-3) echo "api.us-3.crowdstrike.com" ;;
         eu-1) echo "api.eu-1.crowdstrike.com" ;;
         us-gov-1) echo "api.laggar.gcw.crowdstrike.com" ;;
         us-gov-2) echo "api.us-gov-2.crowdstrike.mil" ;;
-        *) die "Unrecognized region option: ${FALCON_CLOUD}" ;;
+        *) die "Unrecognized region option: ${region}" ;;
     esac
 }
 
@@ -294,8 +296,10 @@ curl_command() {
 }
 
 fetch_tags() {
+    # No -L, so --proto-redir is dropped too; nothing follows a redirect here.
     bearer_result=$(echo "-u $ART_USERNAME:$ART_PASSWORD" |
-        curl -s -L "https://$cs_registry/v2/token?account=$ART_USERNAME&scope=repository:$registry_opts/$repository_name:pull&service=$cs_registry" -K-)
+        curl -s --proto '=https' \
+            "https://$cs_registry/v2/token?account=$ART_USERNAME&scope=repository:$registry_opts/$repository_name:pull&service=$cs_registry" -K-)
     handle_curl_error $?
     registry_bearer=$(echo "$bearer_result" | json_value "token" | sed 's/ *$//g' | sed 's/^ *//g')
     # Check if registry_bearer is not empty
@@ -676,20 +680,45 @@ VARIABLES="FALCON_CLIENT_ID FALCON_CLIENT_SECRET"
     [ -n "$VAR_UNSET" ] && usage
 }
 
+# POSTs the OAuth payload from stdin, never argv. $1 = API host, $2 = header dump path.
+oauth_token_request() {
+    curl -X POST -s --proto '=https' "https://$1/oauth2/token" \
+        -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+        -H "User-Agent: crowdstrike-falcon-script/$VERSION" \
+        --dump-header "$2" \
+        --data @-
+}
+
 response_headers=$(mktemp)
 cs_falcon_oauth_token=$(
     if ! command -v curl >/dev/null 2>&1; then
         die "The 'curl' command is missing. Please install it before continuing. Aborting..."
     fi
 
-    token_result=$(echo "client_id=$FALCON_CLIENT_ID&client_secret=$FALCON_CLIENT_SECRET" |
-        curl -X POST -s -L "https://$(cs_cloud)/oauth2/token" \
-            -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
-            -H "User-Agent: crowdstrike-falcon-script/$VERSION" \
-            --dump-header "$response_headers" \
-            --data @-)
+    auth_payload="client_id=$FALCON_CLIENT_ID&client_secret=$FALCON_CLIENT_SECRET"
+
+    token_result=$(echo "$auth_payload" | oauth_token_request "$(cs_cloud)" "$response_headers")
     handle_curl_error $?
     token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
+    if [ -z "$token" ]; then
+        # Wrong region: retry against the x-cs-region hint instead of following
+        # the redirect, which would replay the secret to Location.
+        hinted=$(grep -i ^x-cs-region: "$response_headers" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
+        if [ -n "$hinted" ] && [ "$hinted" != "$FALCON_CLOUD" ]; then
+            # cs_cloud() validates the hint against its own allowlist. Check for
+            # empty rather than trusting its die, which does not stop bash.
+            retry_host=$(cs_cloud "$hinted")
+            if [ -n "$retry_host" ]; then
+                # Separate file: --dump-header truncates, and region_hint below
+                # still needs the original response.
+                retry_headers=$(mktemp)
+                token_result=$(echo "$auth_payload" | oauth_token_request "$retry_host" "$retry_headers")
+                handle_curl_error $?
+                rm -f "$retry_headers"
+                token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
+            fi
+        fi
+    fi
     if [ -z "$token" ]; then
         die "Unable to obtain CrowdStrike Falcon OAuth Token. Double check your credentials and/or ensure you set the correct cloud region."
     fi
