@@ -28,9 +28,9 @@ falcon_debug_scrub() {
         -e 's/[Rr]efresh_[Tt]oken[=:][^[:space:]&"]*/refresh_token=[REDACTED]/g' \
         -e 's/[Pp]rovisioning_[Tt]oken[=:][^[:space:]&"]*/provisioning_token=[REDACTED]/g' \
         -e 's/[Mm]aintenance_[Tt]oken[=:][^[:space:]&"]*/maintenance_token=[REDACTED]/g' \
-        -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]"]*/Authorization:[REDACTED]/g' \
         -e 's/[Bb]earer[[:space:]][^[:space:]]*/Bearer [REDACTED]/g' \
         -e 's/[Bb]asic[[:space:]][^[:space:]]*/Basic [REDACTED]/g' \
+        -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]"]*/Authorization:[REDACTED]/g' \
         -e 's/header[[:space:]]*=[[:space:]]*"Authorization:[^"]*"/header = "Authorization:[REDACTED]"/g' \
         -e 's/[Oo][Ll][Dd]_FALCON_CLIENT_SECRET[=:][^[:space:]&"]*/OLD_FALCON_CLIENT_SECRET=[REDACTED]/g' \
         -e 's/[Nn][Ee][Ww]_FALCON_CLIENT_SECRET[=:][^[:space:]&"]*/NEW_FALCON_CLIENT_SECRET=[REDACTED]/g'

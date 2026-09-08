@@ -278,9 +278,9 @@ function Protect-FalconDebugMessage([string] $Message) {
         '(?i)client_secret\s*[=:]\s*\S+',
         '(?i)(access|refresh|provisioning|maintenance)_?token\s*[=:]\s*\S+',
         '(?i)(OLD_|NEW_)?FALCON_CLIENT_SECRET\s*[=:]\s*\S+',
-        '(?i)authorization\s*[=:]\s*\S+',
         '(?i)bearer\s+\S+',
         '(?i)basic\s+\S+',
+        '(?i)authorization\s*[=:]\s*\S+',
         '(?i)header\s*=\s*"Authorization:[^"]+"'
     )
     foreach ($pattern in $patterns) {
