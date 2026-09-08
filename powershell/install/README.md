@@ -114,6 +114,9 @@ By default, the Falcon sensor for Windows automatically attempts to use any avai
 This parameter forces the sensor to skip those attempts and ignore any proxy configuration, including Windows Proxy Auto Detection.
 .PARAMETER Verbose
 Enable verbose logging
+.PARAMETER FalconDebug
+Enable redacted debug markers (step name, HTTP status, cloud/region). Also honors `$env:FALCON_DEBUG=1`.
+Never prints secrets. Do not use `Set-PSDebug -Trace` or PowerShell's common `-Debug` for support.
 #>
 ```
 
@@ -176,6 +179,9 @@ The proxy host for the sensor to use when communicating with CrowdStrike [defaul
 The proxy port for the sensor to use when communicating with CrowdStrike [default: $null]
 .PARAMETER Verbose
 Enable verbose logging
+.PARAMETER FalconDebug
+Enable redacted debug markers (step name, HTTP status, cloud/region). Also honors `$env:FALCON_DEBUG=1`.
+Never prints secrets. Do not use `Set-PSDebug -Trace` or PowerShell's common `-Debug` for support.
 #>
 ```
 
@@ -195,30 +201,15 @@ Basic example that will uninstall the sensor with the provided maintenance token
 
 ## Troubleshooting
 
-To assist in troubleshooting the installation scripts, you can try the following:
+Use the redacted debug mode for support. It prints step names, HTTP status, and cloud/region only — never secrets.
 
-- Use the `-Verbose` parameter to enable verbose logging.
+```pwsh
+$env:FALCON_DEBUG = '1'
+.\falcon_windows_install.ps1 -FalconClientId <string> -FalconClientSecret <string>
+# or
+.\falcon_windows_install.ps1 -FalconDebug -FalconClientId <string> -FalconClientSecret <string>
+```
 
-  > Note: This will display additional logging in the console, as well as in the log file.
+`-Verbose` still enables extra operational logging in the console and log file. It is not a substitute for `-FalconDebug`.
 
-  Example:
-
-    ```pwsh
-    .\falcon_windows_install.ps1 -Verbose -FalconClientId <string> -FalconClientSecret <string> -ProvToken <string>
-    ```
-
-- For a more detailed approach, you can use `Set-PSDebug -Trace`. This cmdlet offers three trace levels (0-2):
-
-  - 0 : Turn script block logging off. (Equivalent to -Off)
-  - 1 : Turn script block logging on. (Equivalent to -On)
-  - 2 : Turn script block logging on and generate a trace of all commands in a script block and the arguments they were used with.
-    > Similar to the output of `set -x` in bash. Very noisy but contains a lot of useful information.
-
-  Example:
-
-    ```pwsh
-    Set-PSDebug -Trace 2
-    .\falcon_windows_install.ps1 -FalconClientId <string> -FalconClientSecret <string> -ProvToken <string>
-    # To turn off tracing
-    Set-PSDebug -Trace 0
-    ```
+Do **not** run these scripts under `Set-PSDebug -Trace` or PowerShell's common `-Debug` for support. Tracing is forced off at startup (`Set-PSDebug -Off`) so credentials stay out of logs. `Set-PSDebug -Trace` can leak `client_secret`, tokens, `Authorization` headers, and oauth request bodies.

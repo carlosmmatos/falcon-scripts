@@ -64,6 +64,10 @@ This parameter forces the sensor to skip those attempts and ignore any proxy con
 User agent string to append to the User-Agent header when making requests to the CrowdStrike API.
 .PARAMETER Verbose
 Enable verbose logging
+.PARAMETER FalconDebug
+Enable redacted debug markers (step name, HTTP status, cloud/region). Also honors `$env:FALCON_DEBUG=1`.
+Never prints secrets. Do not use `Set-PSDebug -Trace` or PowerShell's common `-Debug` for support.
+Applies the same deny-list to Old/New credentials.
 #>
 #Requires -Version 3.0
 
@@ -132,7 +136,9 @@ param(
     [Parameter(Position = 27)]
     [switch] $ProxyDisable,
     [Parameter(Position = 28)]
-    [string] $UserAgent
+    [string] $UserAgent,
+    [Parameter(Position = 29)]
+    [switch] $FalconDebug
 )
 
 Set-PSDebug -Off
@@ -259,6 +265,40 @@ function Write-VerboseLog ([psobject] $VerboseInput, [string] $PreMessage) {
     Write-FalconLog -Source 'VERBOSE' -Message $message -stdout $false
 }
 
+function Test-FalconDebugEnabled {
+    if ($FalconDebug) { return $true }
+    if ($env:FALCON_DEBUG -match '^(1|true|yes|on)$') { return $true }
+    return $false
+}
+
+function Protect-FalconDebugMessage([string] $Message) {
+    if ([string]::IsNullOrEmpty($Message)) { return $Message }
+    $redacted = $Message
+    $patterns = @(
+        '(?i)client_secret\s*[=:]\s*\S+',
+        '(?i)(access|refresh|provisioning|maintenance)_?token\s*[=:]\s*\S+',
+        '(?i)(OLD_|NEW_)?FALCON_CLIENT_SECRET\s*[=:]\s*\S+',
+        '(?i)bearer\s+\S+',
+        '(?i)basic\s+\S+',
+        '(?i)authorization\s*[=:]\s*\S+',
+        '(?i)header\s*=\s*"Authorization:[^"]+"'
+    )
+    foreach ($pattern in $patterns) {
+        $redacted = [regex]::Replace($redacted, $pattern, '[REDACTED]')
+    }
+    return $redacted
+}
+
+function Write-FalconDebug {
+    param(
+        [Parameter(Mandatory = $true)][string] $Step,
+        [string] $Message
+    )
+    if (-not (Test-FalconDebugEnabled)) { return }
+    $line = if ($Message) { "$Step $Message" } else { $Step }
+    Write-Host "FALCON_DEBUG: $(Protect-FalconDebugMessage $line)"
+}
+
 
 # Uninstall Falcon Sensor
 function Invoke-FalconUninstall ([hashtable] $WebRequestParams, [string] $UninstallParams, [switch] $RemoveHost, [bool] $DeleteUninstaller, [string] $MaintenanceToken, [string] $UninstallTool) {
@@ -326,6 +366,7 @@ function Invoke-FalconUninstall ([hashtable] $WebRequestParams, [string] $Uninst
 
                     $response = Invoke-WebRequest @WebRequestParams -Uri $url -UseBasicParsing -Method 'POST' -Headers $oldCloudHeaders -Body $bodyJson -MaximumRedirection 0
                     $content = ConvertFrom-Json -InputObject $response.Content
+                    Write-FalconDebug -Step 'GetToken' -Message "http_status=$([int]$response.StatusCode)"
 
                     if ($content.errors) {
                         $Message = 'Failed to retrieve maintenance token: '
@@ -340,7 +381,8 @@ function Invoke-FalconUninstall ([hashtable] $WebRequestParams, [string] $Uninst
                     }
                 }
                 catch {
-                    Write-VerboseLog -VerboseInput $_.Exception -PreMessage 'GetToken - CAUGHT EXCEPTION - $_.Exception:'
+                    $debugStatus = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'none' }
+                    Write-FalconDebug -Step 'GetToken' -Message "http_status=$debugStatus error=request_failed"
                     $response = $_.Exception.Response
 
                     if (!$response) {
@@ -685,6 +727,7 @@ function Get-ResourceContent([hashtable] $WebRequestParams, [string] $url, [stri
     try {
         $response = Invoke-WebRequest @WebRequestParams -Uri $url -UseBasicParsing -Method 'GET' -Headers $Headers -MaximumRedirection 0
         $content = ConvertFrom-Json -InputObject $response.Content
+        Write-FalconDebug -Step 'Get-ResourceContent' -Message "http_status=$([int]$response.StatusCode)"
         Write-VerboseLog -VerboseInput $content -PreMessage 'Get-ResourceContent - $content:'
 
         if ($content.errors) {
@@ -703,7 +746,8 @@ function Get-ResourceContent([hashtable] $WebRequestParams, [string] $url, [stri
         }
     }
     catch {
-        Write-VerboseLog -VerboseInput $_.Exception -PreMessage 'Get-ResourceContent - CAUGHT EXCEPTION - $_.Exception:'
+        $debugStatus = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'none' }
+        Write-FalconDebug -Step 'Get-ResourceContent' -Message "http_status=$debugStatus error=request_failed"
         $response = $_.Exception.Response
 
         if (!$response) {
@@ -1093,8 +1137,10 @@ function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [ha
     $Headers = @{'Accept' = 'application/json'; 'Content-Type' = 'application/x-www-form-urlencoded'; 'charset' = 'utf-8' }
     $Headers.Add('User-Agent', $FullUserAgent)
     try {
+        Write-FalconDebug -Step 'Invoke-FalconAuth' -Message "step=request cloud=${FalconCloud}"
         $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body -MaximumRedirection 0
         $content = ConvertFrom-Json -InputObject $response.Content
+        Write-FalconDebug -Step 'Invoke-FalconAuth' -Message "http_status=$([int]$response.StatusCode) cloud=${FalconCloud}"
 
         if ([string]::IsNullOrEmpty($content.access_token)) {
             $message = 'Unable to authenticate to the CrowdStrike Falcon API. Please check your credentials and try again.'
@@ -1104,8 +1150,9 @@ function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [ha
         $Headers.Add('Authorization', "bearer $($content.access_token)")
     }
     catch {
-        # Handle redirects
-        Write-Verbose "Invoke-FalconAuth - CAUGHT EXCEPTION - `$_.Exception.Message`r`n$($_.Exception.Message)"
+        # Handle redirects. Status only — do not dump Exception.Message or Headers (secrets).
+        $debugStatus = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'none' }
+        Write-FalconDebug -Step 'Invoke-FalconAuth' -Message "http_status=$debugStatus error=oauth_request_failed"
         $response = $_.Exception.Response
 
         if (!$response) {
@@ -1119,7 +1166,7 @@ function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [ha
             if ($FalconCloud -eq 'autodiscover') {
                 if ($response.Headers.Contains('X-Cs-Region')) {
                     $region = $response.Headers.GetValues('X-Cs-Region')[0]
-                    Write-Verbose "Received a redirect to $region. Setting FalconCloud to $region"
+                    Write-FalconDebug -Step 'Invoke-FalconAuth' -Message "http_status=$([int]$response.StatusCode) region=$region"
                 }
                 else {
                     $message = 'Received a redirect but no X-Cs-Region header was provided. Unable to autodiscover the FalconCloud. Please set FalconCloud to the correct region.'
@@ -1186,6 +1233,7 @@ $FullUserAgent = if ($UserAgent) {
 } else {
     $BaseUserAgent
 }
+Write-FalconDebug -Step 'start' -Message "version=$ScriptVersion old_cloud=${OldFalconCloud} new_cloud=${NewFalconCloud}"
 
 # Hashtable for common Invoke-WebRequest parameters
 $WebRequestParams = @{}

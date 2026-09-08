@@ -101,7 +101,7 @@ The installer is AWS SSM aware, if `FALCON_CLIENT_ID` and `FALCON_CLIENT_SECRET`
 ## Install Script
 
 ```terminal
-Usage: falcon-linux-install.sh [-h|--help]
+Usage: falcon-linux-install.sh [-h|--help|--debug]
 
 Installs and configures the CrowdStrike Falcon Sensor for Linux.
 Version: 1.13.0
@@ -195,9 +195,16 @@ Other Options
         User agent string to append to the User-Agent header when making
         requests to the CrowdStrike API.
 
-This script recognizes the following argument:
+    - FALCON_DEBUG                      (default: unset)
+        Enable redacted debug markers (step name, HTTP status, cloud/region,
+        curl exit). Never prints secrets. Do not use bash -x for support.
+        Accepted values are ['1', 'true'].
+
+This script recognizes the following arguments:
     -h, --help
         Print this help message and exit.
+    --debug
+        Same as FALCON_DEBUG=1.
 ```
 
 ### Usage
@@ -256,7 +263,7 @@ curl -L https://raw.githubusercontent.com/crowdstrike/falcon-scripts/v1.13.0/bas
 ## Uninstall Script
 
 ```terminal
-Usage: falcon-linux-uninstall.sh [-h|--help]
+Usage: falcon-linux-uninstall.sh [-h|--help|--debug]
 
 Uninstalls the CrowdStrike Falcon Sensor from Linux operating systems.
 Version: 1.13.0
@@ -306,9 +313,16 @@ Other Options:
         User agent string to append to the User-Agent header when making
         requests to the CrowdStrike API.
 
-This script recognizes the following argument:
+    - FALCON_DEBUG                      (default: unset)
+        Enable redacted debug markers (step name, HTTP status, cloud/region,
+        curl exit). Never prints secrets. Do not use bash -x for support.
+        Accepted values are ['1', 'true'].
+
+This script recognizes the following arguments:
     -h, --help
         Print this help message and exit.
+    --debug
+        Same as FALCON_DEBUG=1.
 ```
 
 ### Usage
@@ -336,14 +350,15 @@ curl -L https://raw.githubusercontent.com/crowdstrike/falcon-scripts/v1.13.0/bas
 
 ## Troubleshooting
 
-To troubleshoot installation issues, run the script by using `bash -x`:
+Use the redacted debug mode for support. It prints step names, HTTP status, cloud/region, and curl exit codes only — never secrets.
 
 ```bash
-bash -x falcon-linux-install.sh
+export FALCON_DEBUG=1
+bash falcon-linux-install.sh
+# or
+bash falcon-linux-install.sh --debug
 ```
 
-or
+Do **not** run these scripts under `bash -x` for support. Shell tracing is forced off at startup to keep credentials out of logs. `bash -x` / `set -x` can leak `client_secret`, tokens, `Authorization` headers, oauth POST bodies, and SSM values.
 
-```bash
-curl -L https://raw.githubusercontent.com/crowdstrike/falcon-scripts/v1.13.0/bash/install/falcon-linux-install.sh | bash -x
-```
+The same `FALCON_DEBUG=1` / `--debug` opt-in applies to `falcon-linux-uninstall.sh`.

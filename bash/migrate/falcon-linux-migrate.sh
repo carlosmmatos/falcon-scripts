@@ -19,6 +19,42 @@ FALCON_ACCESS_TOKEN=$falcon_access_token
 FALCON_MAINTENANCE_TOKEN=$falcon_maintenance_token
 FALCON_PROVISIONING_TOKEN=$falcon_provisioning_token
 unset old_falcon_client_secret new_falcon_client_secret falcon_access_token falcon_maintenance_token falcon_provisioning_token
+
+# Opt-in redacted debug. Never re-enable set -x around credential paths.
+falcon_debug_enabled() {
+    case "${FALCON_DEBUG:-}" in
+        1 | true | TRUE | yes | YES | on | ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+falcon_debug_scrub() {
+    # Deny-list: secrets must never appear in debug output. Includes OLD_/NEW_ dual-cred names.
+    printf '%s' "$1" | sed \
+        -e 's/[Cc]lient_[Ss]ecret[=:][^[:space:]&"]*/client_secret=[REDACTED]/g' \
+        -e 's/[Aa]ccess_[Tt]oken[=:][^[:space:]&"]*/access_token=[REDACTED]/g' \
+        -e 's/[Rr]efresh_[Tt]oken[=:][^[:space:]&"]*/refresh_token=[REDACTED]/g' \
+        -e 's/[Pp]rovisioning_[Tt]oken[=:][^[:space:]&"]*/provisioning_token=[REDACTED]/g' \
+        -e 's/[Mm]aintenance_[Tt]oken[=:][^[:space:]&"]*/maintenance_token=[REDACTED]/g' \
+        -e 's/[Bb]earer[[:space:]][^[:space:]]*/Bearer [REDACTED]/g' \
+        -e 's/[Bb]asic[[:space:]][^[:space:]]*/Basic [REDACTED]/g' \
+        -e 's/[Aa]uthorization:[[:space:]]*[^[:space:]"]*/Authorization:[REDACTED]/g' \
+        -e 's/header[[:space:]]*=[[:space:]]*"Authorization:[^"]*"/header = "Authorization:[REDACTED]"/g' \
+        -e 's/[Oo][Ll][Dd]_FALCON_CLIENT_SECRET[=:][^[:space:]&"]*/OLD_FALCON_CLIENT_SECRET=[REDACTED]/g' \
+        -e 's/[Nn][Ee][Ww]_FALCON_CLIENT_SECRET[=:][^[:space:]&"]*/NEW_FALCON_CLIENT_SECRET=[REDACTED]/g'
+}
+
+falcon_debug() {
+    falcon_debug_enabled || return 0
+    printf 'FALCON_DEBUG: %s\n' "$(falcon_debug_scrub "$*")" >&2
+}
+
+falcon_debug_http_status() {
+    # Last HTTP status from a curl --dump-header file. Status only — no header dump.
+    [ -f "$1" ] || return 0
+    grep -i '^HTTP/' "$1" 2>/dev/null | tail -n 1 | awk '{print $2}'
+}
+
 #
 # Bash script to migrate Falcon sensor to another falcon CID.
 #
@@ -28,7 +64,7 @@ VERSION="1.13.0"
 print_usage() {
     cat <<EOF
 
-Usage: $0 [-h|--help]
+Usage: $0 [-h|--help|--debug]
 
 Migrates the Falcon sensor to another Falcon CID.
 Version: $VERSION
@@ -137,9 +173,17 @@ Other Options
         User agent string to append to the User-Agent header when making
         requests to the CrowdStrike API.
 
-This script recognizes the following argument:
+    - FALCON_DEBUG                      (default: unset)
+        Enable redacted debug markers (step name, HTTP status, cloud/region,
+        curl exit). Never prints secrets. Do not use bash -x for support.
+        Applies the same deny-list to OLD_ and NEW_ credentials.
+        Accepted values are ['1', 'true'].
+
+This script recognizes the following arguments:
     -h, --help
         Print this help message and exit.
+    --debug
+        Same as FALCON_DEBUG=1.
 
 EOF
 }
@@ -150,10 +194,17 @@ die() {
 }
 
 # If -h or --help is passed, print the usage and exit
-if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    print_usage
-    exit 0
-fi
+for arg in "$@"; do
+    case "$arg" in
+        -h | --help)
+            print_usage
+            exit 0
+            ;;
+        --debug)
+            FALCON_DEBUG=1
+            ;;
+    esac
+done
 
 # Ensure script is ran as root/sudo
 if [ "$(id -u)" -ne 0 ]; then
@@ -228,17 +279,30 @@ fi
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    local escaped_token auth_config
+    local escaped_token auth_config curl_rc
     # The configuration value must be quoted, because it holds a space and a
     # colon. curl processes backslash escapes inside a quoted value, so a
     # backslash or a double quote in the token has to be escaped first.
     escaped_token=$(printf '%s' "$cs_falcon_oauth_token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     auth_config=$(printf 'header = "Authorization: Bearer %s"' "$escaped_token")
+    if falcon_debug_enabled; then
+        local body_file http_code
+        body_file=$(mktemp)
+        http_code=$(printf '%s\n' "$auth_config" |
+            curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- \
+                -o "$body_file" -w '%{http_code}' "$@") || curl_rc=$?
+        curl_rc=${curl_rc:-0}
+        falcon_debug "curl_command http_status=${http_code:-unknown} curl_exit=${curl_rc}"
+        cat "$body_file"
+        rm -f "$body_file"
+        return "$curl_rc"
+    fi
     printf '%s\n' "$auth_config" |
         curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 
 handle_curl_error() {
+    falcon_debug "handle_curl_error curl_exit=$1"
     if [ "$1" = "28" ]; then
         err_msg="Operation timed out (exit code 28)."
         if [ -n "$proxy" ]; then
@@ -305,6 +369,11 @@ cs_cloud() {
 # Shared auth functions
 get_falcon_credentials() {
     if [ -z "$FALCON_ACCESS_TOKEN" ]; then
+        if [ -n "$FALCON_CLIENT_ID" ]; then
+            falcon_debug "get_falcon_credentials source=env cloud=${FALCON_CLOUD:-${cs_falcon_cloud:-unset}}"
+        else
+            falcon_debug "get_falcon_credentials source=missing cloud=${FALCON_CLOUD:-${cs_falcon_cloud:-unset}}"
+        fi
         cs_falcon_client_id=$(
             if [ -n "$FALCON_CLIENT_ID" ]; then
                 echo "$FALCON_CLIENT_ID"
@@ -328,6 +397,7 @@ get_falcon_credentials() {
             fi
         )
     else
+        falcon_debug "get_falcon_credentials source=access_token cloud=${FALCON_CLOUD:-unset}"
         if [ -z "$FALCON_CLOUD" ]; then
             die "If setting the FALCON_ACCESS_TOKEN manually, you must also specify the FALCON_CLOUD"
         fi
@@ -350,6 +420,7 @@ get_oauth_token() {
 
     cs_falcon_oauth_token=$(
         if [ -n "$FALCON_ACCESS_TOKEN" ]; then
+            falcon_debug "oauth2_token source=access_token cloud=${cs_falcon_cloud:-unset}"
             token=$FALCON_ACCESS_TOKEN
         else
             # Build the auth request payload, adding member_cid if specified
@@ -363,14 +434,18 @@ get_oauth_token() {
             # and do not follow redirects (-L removed): curl replays the request
             # body on a 307/308 redirect, so following one could leak the secret
             # to a redirect target. The token endpoint never legitimately redirects.
+            falcon_debug "oauth2_token step=request cloud=${cs_falcon_cloud:-unset}"
             token_result=$(echo "$auth_payload" |
                 curl -X POST -s -x "$proxy" --proto '=https' --proto-redir '=https' "https://$(cs_cloud)/oauth2/token" \
                     -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
                     -H "User-Agent: $(get_user_agent)" \
                     --dump-header "${response_headers}" \
                     --data @-)
+            oauth_curl_rc=$?
+            oauth_http_status=$(falcon_debug_http_status "${response_headers}")
+            falcon_debug "oauth2_token step=response http_status=${oauth_http_status:-unknown} curl_exit=${oauth_curl_rc} cloud=${cs_falcon_cloud:-unset}"
 
-            handle_curl_error $?
+            handle_curl_error "$oauth_curl_rc"
 
             token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
             if [ -z "$token" ]; then
@@ -382,6 +457,7 @@ get_oauth_token() {
 
     if [ -z "$FALCON_ACCESS_TOKEN" ]; then
         region_hint=$(grep -i ^x-cs-region: "$response_headers" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
+        falcon_debug "oauth2_token region_hint=${region_hint:-none} cloud=${cs_falcon_cloud:-unset}"
 
         if [ -z "${FALCON_CLOUD}" ]; then
             if [ -z "${region_hint}" ]; then
@@ -1139,6 +1215,7 @@ authenticate_to_falcon() {
     FALCON_CID=$cid
     cs_falcon_cloud="${cloud:-us-1}"
     cs_falcon_member_cid=$member_cid
+    falcon_debug "authenticate_to_falcon cloud=${cs_falcon_cloud}"
     get_oauth_token
 }
 
@@ -1383,6 +1460,7 @@ if [ -n "$FALCON_SENSOR_CLOUD" ]; then
 fi
 
 main() {
+    falcon_debug "start version=$VERSION old_cloud=${OLD_FALCON_CLOUD:-unset} new_cloud=${NEW_FALCON_CLOUD:-unset}"
     # Start of migration
     touch "$log_file"
     echo "Migration file created at: $log_file"
@@ -1390,6 +1468,7 @@ main() {
 
     # auth with old credentials
     log "INFO" "Authenticating to old CID..."
+    falcon_debug "migrate step=auth_old_cid cloud=${OLD_FALCON_CLOUD:-unset}"
     authenticate_to_falcon "$OLD_FALCON_CLIENT_ID" "$OLD_FALCON_CLIENT_SECRET" "$OLD_FALCON_CLOUD" "$OLD_FALCON_MEMBER_CID"
 
     # Check if we are in recovery mode
@@ -1446,6 +1525,7 @@ main() {
     # Install new sensor
     # auth with new credentials
     log "INFO" "Authenticating to new CID..."
+    falcon_debug "migrate step=auth_new_cid cloud=${NEW_FALCON_CLOUD:-unset}"
     authenticate_to_falcon "$NEW_FALCON_CLIENT_ID" "$NEW_FALCON_CLIENT_SECRET" "$NEW_FALCON_CLOUD" "$NEW_FALCON_CID" "$NEW_FALCON_MEMBER_CID"
 
     log "INFO" "Checking if tags need to be migrated..."
