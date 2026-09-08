@@ -207,16 +207,23 @@ begin {
     }
 
     function Get-FalconRegionHeader($Response) {
-        # Reads X-Cs-Region off a response whose header collection type varies by
-        # platform and by which code path produced it. The wrong accessor fails
-        # quietly rather than loudly, so probe instead of assuming. Measured:
-        #   PowerShell 7 catch      System.Net.Http.Headers.HttpResponseHeaders
-        #                           Contains/GetValues work. The string indexer
-        #                           returns EMPTY instead of throwing, so it must
-        #                           not be tried first.
-        #   Windows PowerShell 5.1  System.Net.WebHeaderCollection, which has a
-        #                           string indexer and no Contains method.
-        #   success path            a Dictionary, so ContainsKey.
+        # Reads X-Cs-Region off a response whose header collection type differs by
+        # platform and by which code path produced it, and where the wrong accessor
+        # fails quietly rather than loudly. Measured:
+        #   PowerShell 7, thrown 3xx    System.Net.Http.Headers.HttpResponseHeaders.
+        #                               Contains/GetValues work, but the string
+        #                               indexer returns EMPTY rather than failing,
+        #                               so it must not be tried first.
+        #   Windows PowerShell 5.1,     Invoke-WebRequest RETURNS the 3xx as a
+        #   returned 3xx                WebResponseObject; this reads the region off
+        #                               it correctly end to end. Its Content is a
+        #                               Byte[], which is what made the old code fail
+        #                               in ConvertFrom-Json before ever getting here.
+        #   5.1, thrown errors          System.Net.WebHeaderCollection, which has a
+        #                               string indexer and no Contains method. The
+        #                               indexer branch below is verified against a
+        #                               real one on 5.1.
+        # Hence: probe by type and by which accessor exists, rather than assuming.
         if (!$Response) {
             return $null
         }
