@@ -294,10 +294,6 @@ curl_command() {
 }
 
 fetch_tags() {
-    # Registry login carries Basic auth via -K-. Pin the scheme to https and do
-    # not follow redirects (-L removed): an https→https redirect defeats
-    # --proto-redir '=https', so following one could contact a second hop
-    # (CAND-002 A). The token endpoint does not legitimately redirect.
     bearer_result=$(echo "-u $ART_USERNAME:$ART_PASSWORD" |
         curl -s --proto '=https' --proto-redir '=https' \
             "https://$cs_registry/v2/token?account=$ART_USERNAME&scope=repository:$registry_opts/$repository_name:pull&service=$cs_registry" -K-)
@@ -687,10 +683,6 @@ cs_falcon_oauth_token=$(
         die "The 'curl' command is missing. Please install it before continuing. Aborting..."
     fi
 
-    # This POST body carries the client secret. Pin the scheme to https and do
-    # not follow redirects (-L removed): curl replays the request body on a
-    # 307/308 redirect, so following one could leak the secret to a redirect
-    # target. The token endpoint never legitimately redirects.
     token_result=$(echo "client_id=$FALCON_CLIENT_ID&client_secret=$FALCON_CLIENT_SECRET" |
         curl -X POST -s --proto '=https' --proto-redir '=https' "https://$(cs_cloud)/oauth2/token" \
             -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
