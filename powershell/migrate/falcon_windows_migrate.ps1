@@ -1004,23 +1004,9 @@ function Get-FalconCloud ([string] $xCsRegion) {
 
 
 function Get-FalconRegionHeader($Response) {
-    # Reads X-Cs-Region off a response whose header collection type differs by
-    # platform and by which code path produced it, and where the wrong accessor
-    # fails quietly rather than loudly. Measured:
-    #   PowerShell 7, thrown 3xx    System.Net.Http.Headers.HttpResponseHeaders.
-    #                               Contains/GetValues work, but the string indexer
-    #                               returns EMPTY rather than failing, so it must
-    #                               not be tried first.
-    #   Windows PowerShell 5.1,     Invoke-WebRequest RETURNS the 3xx as a
-    #   returned 3xx                WebResponseObject; this reads the region off it
-    #                               correctly end to end. Its Content is a Byte[],
-    #                               which is what made the old code fail in
-    #                               ConvertFrom-Json before ever getting here.
-    #   5.1, thrown errors          System.Net.WebHeaderCollection, which has a
-    #                               string indexer and no Contains method. The
-    #                               indexer branch below is verified against a real
-    #                               one on 5.1.
-    # Hence: probe by type and by which accessor exists, rather than assuming.
+    # Reads X-Cs-Region. The header collection type differs by platform and by
+    # which code path produced it (HttpResponseHeaders vs WebHeaderCollection vs
+    # a Dictionary), so probe by type/method instead of assuming one shape.
     if (!$Response) {
         return $null
     }
@@ -1032,8 +1018,8 @@ function Get-FalconRegionHeader($Response) {
         return $ResponseHeaders['X-Cs-Region']
     }
     $HeaderMethods = @($ResponseHeaders.PSObject.Methods.Name)
-    # ContainsKey is checked first: HttpResponseHeaders does not have it, so this
-    # cannot capture the PowerShell 7 case by mistake.
+    # ContainsKey first: HttpResponseHeaders lacks it, so this can't misfire on
+    # PowerShell 7.
     if ($HeaderMethods -contains 'ContainsKey') {
         if ($ResponseHeaders.ContainsKey('X-Cs-Region')) {
             return @($ResponseHeaders['X-Cs-Region'])[0]
@@ -1053,16 +1039,10 @@ function Get-FalconRegionHeader($Response) {
 function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [hashtable] $Body, [string] $FalconCloud) {
     $Headers = @{'Accept' = 'application/json'; 'Content-Type' = 'application/x-www-form-urlencoded'; 'charset' = 'utf-8' }
     $Headers.Add('User-Agent', $FullUserAgent)
-    # A 3xx here is the documented region auto-discovery, not an error: the API
-    # answers a wrong-region token request with 308 and an X-Cs-Region header.
-    # -MaximumRedirection 0 stops the client from following it, because a 307 or
-    # 308 replays the request BODY, and the body is where the client secret is.
-    #
-    # The two platforms report that 3xx differently. PowerShell 7 throws an
-    # HttpResponseException. Windows PowerShell 5.1 sets AllowAutoRedirect=false
-    # and hands every 300-399 response back to the caller, so nothing is thrown
-    # and the catch never runs there. Both are funnelled into $RedirectResponse
-    # and handled once.
+    # A 3xx here is the region auto-discovery hint (X-Cs-Region), not an error.
+    # -MaximumRedirection 0 blocks it because 307/308 replay the secret in the
+    # body. PowerShell 7 throws it; Windows PowerShell 5.1 returns it, and both
+    # funnel into $RedirectResponse and are handled once below.
     $RedirectResponse = $null
     try {
         $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body -MaximumRedirection 0
@@ -1118,9 +1098,8 @@ function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [ha
         }
 
         Write-Verbose "Received a redirect to $region. Setting FalconCloud to $region"
-        # Get-FalconCloud maps a known region name to a URL and throws on anything
-        # else, so the retry goes to a host from this script's own allowlist,
-        # never to whatever the Location header named.
+        # Get-FalconCloud validates the region against its own allowlist, not
+        # the Location header.
         $BaseUrl = Get-FalconCloud($region)
         $BaseUrl, $Headers = Invoke-FalconAuth -WebRequestParams $WebRequestParams -BaseUrl $BaseUrl -Body $Body -FalconCloud $FalconCloud
     }

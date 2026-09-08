@@ -291,9 +291,7 @@ check_package_manager_lock() {
 }
 
 cs_cloud() {
-    # $1 names the region and defaults to cs_falcon_cloud. The OAuth retry
-    # passes it explicitly, so it does not have to reassign cs_falcon_cloud
-    # inside a subshell, where the change would be invisible to the caller.
+    # $1 optionally overrides cs_falcon_cloud, used by the OAuth region retry.
     local region="${1:-$cs_falcon_cloud}"
     case "${region}" in
         us-1) echo "api.crowdstrike.com" ;;
@@ -346,9 +344,7 @@ get_user_agent() {
     echo "$user_agent"
 }
 
-# Issues the OAuth token POST. The payload is read from stdin, never passed in
-# argv, because argv is world readable. $1 is the API host, $2 is the path to
-# dump the response headers to.
+# POSTs the OAuth payload from stdin, never argv. $1 = API host, $2 = header dump path.
 oauth_token_request() {
     curl -X POST -s -x "$proxy" --proto '=https' "https://$1/oauth2/token" \
         -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
@@ -380,24 +376,16 @@ get_oauth_token() {
 
             token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
             if [ -z "$token" ]; then
-                # The API answers a wrong-region request with a 308 and an
-                # x-cs-region header. That is the documented region
-                # auto-discovery. Re-issue the request against the named region
-                # instead of letting curl follow the redirect: -L would replay
-                # the client secret in the body to whatever host Location gives.
+                # Wrong region: retry against the x-cs-region hint instead of
+                # following the redirect, which would replay the secret to Location.
                 hinted=$(grep -i ^x-cs-region: "${response_headers}" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
                 if [ -n "$hinted" ] && [ "$hinted" != "$cs_falcon_cloud" ]; then
-                    # cs_cloud() maps a known region name to a host and dies on
-                    # anything else, so the retry target comes from our own
-                    # allowlist and a hostile hint cannot steer the credential.
-                    # Measured: that die does end the script under dash, but NOT
-                    # under bash, where exiting a nested command substitution
-                    # leaves the caller running. So test the result instead of
-                    # trusting the die, and skip the retry when it is empty.
+                    # cs_cloud() validates the hint against its own allowlist. Check
+                    # for empty rather than trusting its die, which does not stop bash.
                     retry_host=$(cs_cloud "$hinted")
                     if [ -n "$retry_host" ]; then
-                        # A separate dump file: --dump-header truncates, and the
-                        # region_hint block below still needs the first response.
+                        # Separate file: --dump-header truncates, and region_hint below
+                        # still needs the original response.
                         retry_headers=$(mktemp)
                         token_result=$(echo "$auth_payload" | oauth_token_request "$retry_host" "$retry_headers")
                         handle_curl_error $?
