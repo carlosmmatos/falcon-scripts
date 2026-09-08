@@ -92,14 +92,18 @@ deprecated() {
 }
 
 cs_cloud() {
-    case "${FALCON_CLOUD}" in
+    # $1 names the region and defaults to FALCON_CLOUD. The OAuth retry passes
+    # it explicitly, so it does not have to reassign FALCON_CLOUD inside a
+    # subshell, where the change would be invisible to the caller anyway.
+    local region="${1:-$FALCON_CLOUD}"
+    case "${region}" in
         us-1) echo "api.crowdstrike.com" ;;
         us-2) echo "api.us-2.crowdstrike.com" ;;
         us-3) echo "api.us-3.crowdstrike.com" ;;
         eu-1) echo "api.eu-1.crowdstrike.com" ;;
         us-gov-1) echo "api.laggar.gcw.crowdstrike.com" ;;
         us-gov-2) echo "api.us-gov-2.crowdstrike.mil" ;;
-        *) die "Unrecognized region option: ${FALCON_CLOUD}" ;;
+        *) die "Unrecognized region option: ${region}" ;;
     esac
 }
 
@@ -677,20 +681,55 @@ VARIABLES="FALCON_CLIENT_ID FALCON_CLIENT_SECRET"
     [ -n "$VAR_UNSET" ] && usage
 }
 
+# Issues the OAuth token POST. The payload is read from stdin, never passed in
+# argv, because argv is world readable. $1 is the API host, $2 is the path to
+# dump the response headers to.
+oauth_token_request() {
+    curl -X POST -s --proto '=https' "https://$1/oauth2/token" \
+        -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+        -H "User-Agent: crowdstrike-falcon-script/$VERSION" \
+        --dump-header "$2" \
+        --data @-
+}
+
 response_headers=$(mktemp)
 cs_falcon_oauth_token=$(
     if ! command -v curl >/dev/null 2>&1; then
         die "The 'curl' command is missing. Please install it before continuing. Aborting..."
     fi
 
-    token_result=$(echo "client_id=$FALCON_CLIENT_ID&client_secret=$FALCON_CLIENT_SECRET" |
-        curl -X POST -s --proto '=https' --proto-redir '=https' "https://$(cs_cloud)/oauth2/token" \
-            -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
-            -H "User-Agent: crowdstrike-falcon-script/$VERSION" \
-            --dump-header "$response_headers" \
-            --data @-)
+    auth_payload="client_id=$FALCON_CLIENT_ID&client_secret=$FALCON_CLIENT_SECRET"
+
+    token_result=$(echo "$auth_payload" | oauth_token_request "$(cs_cloud)" "$response_headers")
     handle_curl_error $?
     token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
+    if [ -z "$token" ]; then
+        # The API answers a wrong-region request with a 308 and an x-cs-region
+        # header. That is the documented region auto-discovery. Re-issue the
+        # request against the named region instead of letting curl follow the
+        # redirect: -L would replay the client secret in the body to whatever
+        # host Location gives.
+        hinted=$(grep -i ^x-cs-region: "$response_headers" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
+        if [ -n "$hinted" ] && [ "$hinted" != "$FALCON_CLOUD" ]; then
+            # cs_cloud() maps a known region name to a host and dies on anything
+            # else, so the retry target comes from our own allowlist and a
+            # hostile hint cannot steer the credential.
+            # Measured: that die does end the script under dash, but NOT under
+            # bash, where exiting a nested command substitution leaves the caller
+            # running. So test the result instead of trusting the die, and skip
+            # the retry when it is empty.
+            retry_host=$(cs_cloud "$hinted")
+            if [ -n "$retry_host" ]; then
+                # A separate dump file: --dump-header truncates, and the
+                # region_hint block below still needs the first response.
+                retry_headers=$(mktemp)
+                token_result=$(echo "$auth_payload" | oauth_token_request "$retry_host" "$retry_headers")
+                handle_curl_error $?
+                rm -f "$retry_headers"
+                token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
+            fi
+        fi
+    fi
     if [ -z "$token" ]; then
         die "Unable to obtain CrowdStrike Falcon OAuth Token. Double check your credentials and/or ensure you set the correct cloud region."
     fi
