@@ -298,8 +298,12 @@ curl_command() {
 }
 
 fetch_tags() {
+    # No -L, so no --proto-redir either: with nothing following a redirect, the
+    # redirect protocol pin is dead and only makes it look as though redirects
+    # were handled here. Measured on registry.crowdstrike.com: every call on this
+    # path answers 200 in one hop, so there is no redirect to follow.
     bearer_result=$(echo "-u $ART_USERNAME:$ART_PASSWORD" |
-        curl -s --proto '=https' --proto-redir '=https' \
+        curl -s --proto '=https' \
             "https://$cs_registry/v2/token?account=$ART_USERNAME&scope=repository:$registry_opts/$repository_name:pull&service=$cs_registry" -K-)
     handle_curl_error $?
     registry_bearer=$(echo "$bearer_result" | json_value "token" | sed 's/ *$//g' | sed 's/^ *//g')
