@@ -1,4 +1,24 @@
 #!/bin/bash
+
+case $- in
+    *x*)
+        set +x
+        printf '%s\n' 'WARNING: shell tracing disabled to protect credentials.' >&2
+        ;;
+esac
+
+old_falcon_client_secret=$OLD_FALCON_CLIENT_SECRET
+new_falcon_client_secret=$NEW_FALCON_CLIENT_SECRET
+falcon_access_token=$FALCON_ACCESS_TOKEN
+falcon_maintenance_token=$FALCON_MAINTENANCE_TOKEN
+falcon_provisioning_token=$FALCON_PROVISIONING_TOKEN
+unset OLD_FALCON_CLIENT_SECRET NEW_FALCON_CLIENT_SECRET FALCON_ACCESS_TOKEN FALCON_MAINTENANCE_TOKEN FALCON_PROVISIONING_TOKEN
+OLD_FALCON_CLIENT_SECRET=$old_falcon_client_secret
+NEW_FALCON_CLIENT_SECRET=$new_falcon_client_secret
+FALCON_ACCESS_TOKEN=$falcon_access_token
+FALCON_MAINTENANCE_TOKEN=$falcon_maintenance_token
+FALCON_PROVISIONING_TOKEN=$falcon_provisioning_token
+unset old_falcon_client_secret new_falcon_client_secret falcon_access_token falcon_maintenance_token falcon_provisioning_token
 #
 # Bash script to migrate Falcon sensor to another falcon CID.
 #
@@ -111,7 +131,7 @@ Other Options
         Accepted values are [us-1|us-2|us-3|eu-1|us-gov-1|us-gov-2].
 
     - ALLOW_LEGACY_CURL                 (default: false)
-        To use the legacy version of curl; version < 7.55.0.
+        Deprecated. Accepted and ignored; no longer needed.
 
     - USER_AGENT                        (default: unset)
         User agent string to append to the User-Agent header when making
@@ -198,31 +218,24 @@ uninstall_sensor() {
 }
 
 # Shared functions
-old_curl=$(
-    if ! command -v curl >/dev/null 2>&1; then
-        die "The 'curl' command is missing. Please install it before continuing. Aborting..."
-    fi
+if ! command -v curl >/dev/null 2>&1; then
+    die "The 'curl' command is missing. Please install it before continuing. Aborting..."
+fi
 
-    version=$(curl --version | head -n 1 | awk '{ print $2 }')
-    minimum="7.55"
-
-    # Check if the version is less than the minimum
-    if printf "%s\n" "$version" "$minimum" | sort -V -C; then
-        echo 0
-    else
-        echo 1
-    fi
-)
+if [ "${ALLOW_LEGACY_CURL:-false}" = "true" ]; then
+    echo "NOTICE: ALLOW_LEGACY_CURL is no longer needed and is ignored." >&2
+fi
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    set -- "$@"
-
-    if [ "$old_curl" -eq 0 ]; then
-        curl -s -x "$proxy" -L -H "Authorization: Bearer ${cs_falcon_oauth_token}" "$@"
-    else
-        echo "Authorization: Bearer ${cs_falcon_oauth_token}" | curl -s -x "$proxy" -L -H @- "$@"
-    fi
+    local escaped_token auth_config
+    # The configuration value must be quoted, because it holds a space and a
+    # colon. curl processes backslash escapes inside a quoted value, so a
+    # backslash or a double quote in the token has to be escaped first.
+    escaped_token=$(printf '%s' "$cs_falcon_oauth_token" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    auth_config=$(printf 'header = "Authorization: Bearer %s"' "$escaped_token")
+    printf '%s\n' "$auth_config" |
+        curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 
 handle_curl_error() {
@@ -472,7 +485,7 @@ get_maintenance_token() {
             die "Retrieved empty maintenance token from API."
         fi
     else
-        die "Failed to retrieve maintenance token. Response: $response"
+        die "Failed to retrieve a maintenance token from the Falcon API."
     fi
 }
 
@@ -574,7 +587,7 @@ cs_sensor_policy_version() {
     if echo "$sensor_update_policy" | grep "authorization failed"; then
         die "Access denied: Please make sure that your Falcon API credentials allow access to sensor update policies (scope Sensor update policies [read])"
     elif echo "$sensor_update_policy" | grep "invalid bearer token"; then
-        die "Invalid Access Token: $cs_falcon_oauth_token"
+        die "Invalid or expired Falcon access token."
     fi
 
     sensor_update_versions=$(echo "$sensor_update_policy" | json_value "sensor_version")
@@ -596,6 +609,33 @@ cs_sensor_policy_version() {
         echo "$1"
     fi
     IFS=$oldIFS
+}
+
+# Compare the downloaded installer against the SHA-256 that the API supplied.
+# That digest is the download id in the request URL, so this check finds
+# truncation and alteration in transit. It is not a signature check: the digest
+# and the file come from the same response, so it does not prove who built the
+# installer.
+verify_sha256() {
+    local file="$1" expected_sha="$2" local_sha
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        local_sha=$(sha256sum "$file" | awk '{ print $1 }')
+    elif command -v openssl >/dev/null 2>&1; then
+        local_sha=$(openssl dgst -sha256 "$file" | awk '{ print $NF }')
+    else
+        # Keep the file. The download is not known to be bad, only unverified.
+        die "Cannot verify the downloaded sensor installer: neither 'sha256sum' nor 'openssl' is available. Install one of them and try again. The download is kept at $file."
+        # die exits, so shellcheck reports the return below as unreachable and
+        # it is. Keep it anyway: if die ever stops exiting, control would reach
+        # the comparison with an empty digest and delete the file.
+        # shellcheck disable=SC2317
+        return 1
+    fi
+    if [ "$local_sha" != "$expected_sha" ]; then
+        rm -f "$file"
+        die "Downloaded sensor installer failed SHA-256 verification."
+    fi
 }
 
 cs_sensor_download() {
@@ -621,7 +661,7 @@ cs_sensor_download() {
     if echo "$existing_installers" | grep "authorization failed"; then
         die "Access denied: Please make sure that your Falcon API credentials allow sensor download (scope Sensor Download [read])"
     elif echo "$existing_installers" | grep "invalid bearer token"; then
-        die "Invalid Access Token: $cs_falcon_oauth_token"
+        die "Invalid or expired Falcon access token."
     fi
 
     sha_list=$(echo "$existing_installers" | json_value "sha256")
@@ -644,6 +684,8 @@ cs_sensor_download() {
     curl_command "https://$(cs_cloud)/sensors/entities/download-installer/v3?id=$sha" -o "${installer}"
 
     handle_curl_error $?
+
+    verify_sha256 "$installer" "$sha"
 
     echo "$installer"
 }
@@ -860,7 +902,7 @@ get_falcon_tags() {
     if echo "$response" | grep "authorization failed" >/dev/null; then
         die "Access denied: Please make sure your Falcon API credentials allow access to host data (scope Host [read])"
     elif echo "$response" | grep "invalid bearer token" >/dev/null; then
-        die "Invalid Access Token: $cs_falcon_oauth_token"
+        die "Invalid or expired Falcon access token."
     fi
 
     # Extract tags from response

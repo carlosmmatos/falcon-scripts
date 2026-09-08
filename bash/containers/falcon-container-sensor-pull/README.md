@@ -50,11 +50,9 @@ CrowdStrike now provides unified images that work across all regions:
 
 ## Security recommendations
 
-### Use cURL version 7.55.0 or later
+### Credential handling
 
-We've identified a security concern related to cURL versions 7.54.1 and earlier. In these versions, request headers were set using the `-H` option, which allowed potential secrets to be exposed via the command line. In newer versions of cURL, versions 7.55.0 and later, you can pass headers from stdin using the `@-` syntax, which addresses this security concern. **We recommend that you to upgrade cURL to version 7.55.0 or later**. If this is not possible, this script offers compatibility with the older method through the use of the `--allow-legacy-curl` optional command line flag.
-
-To check your version of cURL, run the following command: `curl --version`
+Credentials travel on cURL's configuration input rather than the command line, and every request and redirect is restricted to HTTPS. This works with the cURL that RHEL and CentOS 7 ship, and with current cURL.
 
 ## Prerequisites
 
@@ -136,7 +134,7 @@ Optional Flags:
     --get-pull-token                               Get the pull token of the selected SENSOR_TYPE for Kubernetes
     --get-cid                                      Get the CID assigned to the API Credentials
     --list-tags                                    List all tags available for the selected sensor type and platform, sorted in ascending order
-    --allow-legacy-curl                            Allow the script to run with an older version of curl
+    --allow-legacy-curl                            Deprecated. Accepted and ignored; no longer needed
 
 Internal Flags:
     --internal-build-stage <BUILD_STAGE>           (Internal only) Falcon Build Stage [release|stage] (Default: release)
@@ -167,7 +165,7 @@ Help Options:
 | `--get-pull-token`                             | N/A                     | `None`                        | Get the pull token of the selected `SENSOR_TYPE` for Kubernetes.                                                                                                                                                                                         |
 | `--get-cid`                                    | N/A                     | `None`                        | Get the CID assigned to the API Credentials.                                                                                                                                                                                                             |
 | `--list-tags`                                  | `$LISTTAGS`             | `False` (Optional)            | List all tags available for the selected sensor                                                                                                                                                                                                          |
-| `--allow-legacy-curl`                          | `$ALLOW_LEGACY_CURL`    | `False` (Optional)            | Allow the script to run with an older version of cURL                                                                                                                                                                                                    |
+| `--allow-legacy-curl`                          | `$ALLOW_LEGACY_CURL`    | `False` (Optional)            | Deprecated. Accepted and ignored; no longer needed                                                                                                                                                                                                       |
 | `-h`, `--help`                                 | N/A                     | `None`                        | Display help message                                                                                                                                                                                                                                     |
 
 ---

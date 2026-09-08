@@ -135,6 +135,8 @@ param(
     [string] $UserAgent
 )
 begin {
+    Set-PSDebug -Off
+
     if ($PSVersionTable.PSVersion -lt '3.0')
     { throw "This script requires a miniumum PowerShell 3.0" }
 
@@ -214,7 +216,6 @@ begin {
             try {
                 $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body
                 $content = ConvertFrom-Json -InputObject $response.Content
-                Write-VerboseLog -VerboseInput $content -PreMessage 'Invoke-FalconAuth - $content:'
 
                 if ([string]::IsNullOrEmpty($content.access_token)) {
                     $message = 'Unable to authenticate to the CrowdStrike Falcon API. Please check your credentials and try again.'
@@ -597,7 +598,7 @@ process {
 
     # Begin installation
     Write-FalconLog 'Installer' 'Installing Falcon Sensor...'
-    Write-FalconLog 'StartProcess' "Starting installer with parameters: '$InstallParams'"
+    Write-FalconLog 'StartProcess' 'Starting installer; command-line parameters omitted from the log because they may contain sensitive values'
     try {
         $process = (Start-Process -FilePath $LocalFile -ArgumentList $InstallParams -PassThru -ErrorAction SilentlyContinue)
         Write-FalconLog 'StartProcess' "Started '$LocalFile' ($($process.Id))"

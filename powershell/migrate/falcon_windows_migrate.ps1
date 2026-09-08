@@ -135,6 +135,8 @@ param(
     [string] $UserAgent
 )
 
+Set-PSDebug -Off
+
 
 function Write-RecoveryCsv {
     param (
@@ -324,7 +326,6 @@ function Invoke-FalconUninstall ([hashtable] $WebRequestParams, [string] $Uninst
 
                     $response = Invoke-WebRequest @WebRequestParams -Uri $url -UseBasicParsing -Method 'POST' -Headers $oldCloudHeaders -Body $bodyJson -MaximumRedirection 0
                     $content = ConvertFrom-Json -InputObject $response.Content
-                    Write-VerboseLog -VerboseInput $content -PreMessage 'GetToken - $content:'
 
                     if ($content.errors) {
                         $Message = 'Failed to retrieve maintenance token: '
@@ -334,7 +335,7 @@ function Invoke-FalconUninstall ([hashtable] $WebRequestParams, [string] $Uninst
                     }
                     else {
                         $MaintenanceToken = $content.resources[0].uninstall_token
-                        Write-FalconLog -Source 'Invoke-FalconUninstall' -Message "Retrieved maintenance token: $MaintenanceToken"
+                        Write-FalconLog -Source 'Invoke-FalconUninstall' -Message 'Retrieved maintenance token'
                         $UninstallParams += " MAINTENANCE_TOKEN=$MaintenanceToken"
                     }
                 }
@@ -369,7 +370,7 @@ function Invoke-FalconUninstall ([hashtable] $WebRequestParams, [string] $Uninst
 
         # Begin uninstallation
         Write-FalconLog -Source 'Invoke-FalconUninstall' -Message 'Uninstalling Falcon Sensor...'
-        Write-FalconLog -Source 'Invoke-FalconUninstall' -Message "Starting uninstaller with parameters: '$UninstallParams'"
+        Write-FalconLog -Source 'Invoke-FalconUninstall' -Message 'Starting uninstaller; command-line parameters omitted from the log because they may contain sensitive values'
         $UninstallerProcess = Start-Process -FilePath "$UninstallerPath" -ArgumentList $UninstallParams -PassThru -Wait
         $UninstallerProcessId = $UninstallerProcess.Id
         Write-FalconLog -Source 'Invoke-FalconUninstall' -Message "Started '$UninstallerPath' ($UninstallerProcessId)"
@@ -579,7 +580,7 @@ function Invoke-FalconInstall ([hashtable] $WebRequestParams, [string] $InstallP
 
         # Begin installation
         Write-FalconLog -Source 'Invoke-FalconInstall' -Message "Installing Falcon Sensor..."
-        Write-FalconLog -Source 'Invoke-FalconInstall' -Message "Starting installer '$LocalFile' with parameters '$InstallParams'"
+        Write-FalconLog -Source 'Invoke-FalconInstall' -Message "Starting installer '$LocalFile'; command-line parameters omitted from the log because they may contain sensitive values"
 
         $process = (Start-Process -FilePath $LocalFile -ArgumentList $InstallParams -PassThru -ErrorAction SilentlyContinue)
         Write-FalconLog -Source 'Invoke-FalconInstall' -Message "Started '$LocalFile' ($($process.Id))"
@@ -1008,7 +1009,6 @@ function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [ha
     try {
         $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body
         $content = ConvertFrom-Json -InputObject $response.Content
-        Write-VerboseLog -VerboseInput $content -PreMessage 'Invoke-FalconAuth - $content:'
 
         if ([string]::IsNullOrEmpty($content.access_token)) {
             $message = 'Unable to authenticate to the CrowdStrike Falcon API. Please check your credentials and try again.'

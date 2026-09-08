@@ -7,11 +7,9 @@ environment variable. Consult the Environment Variables for each script for more
 
 ## Security Recommendations
 
-### Use cURL version 7.55.0 or newer
+### Credential handling
 
-We have identified a security concern related to cURL versions prior to 7.55, which required request headers to be set using the `-H` option, thus allowing potential secrets to be exposed via the command line. In newer versions of cURL, you can pass headers from stdin using the `@-` syntax, which addresses this security concern. Although our script offers compatibility with the older method by allowing you to set the environment variable `ALLOW_LEGACY_CURL=true`, we strongly urge you to upgrade cURL if your environment permits.
-
-To check your version of cURL, run the following command: `curl --version`
+Credentials travel on cURL's configuration input rather than the command line, and every request and redirect is restricted to HTTPS. This works with the cURL that RHEL and CentOS 7 ship, and with current cURL.
 
 ## Table of Contents
 
@@ -182,7 +180,7 @@ Other Options
         The path to download the falcon sensor to.
 
     - ALLOW_LEGACY_CURL                 (default: false)
-        To use the legacy version of curl; version < 7.55.0.
+        Deprecated. Accepted and ignored; no longer needed.
 
     - GET_ACCESS_TOKEN                  (default: false)
         Prints an access token and exits.

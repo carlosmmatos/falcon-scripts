@@ -1,4 +1,17 @@
 #!/bin/bash
+
+case $- in
+    *x*)
+        set +x
+        printf '%s\n' 'WARNING: shell tracing disabled to protect credentials.' >&2
+        ;;
+esac
+
+falcon_client_secret=$FALCON_CLIENT_SECRET
+unset FALCON_CLIENT_SECRET
+FALCON_CLIENT_SECRET=$falcon_client_secret
+unset falcon_client_secret
+
 : <<'#DESCRIPTION#'
 File: falcon-container-sensor-pull.sh
 Description: Bash script to copy Falcon DaemonSet Sensor, Container Sensor, or Kubernetes Admission Controller images from CrowdStrike Container Registry.
@@ -58,7 +71,7 @@ Optional Flags:
     --get-pull-token                               Get the pull token of the selected SENSOR_TYPE for Kubernetes
     --get-cid                                      Get the CID assigned to the API Credentials
     --list-tags                                    List all tags available for the selected sensor type and platform, sorted in ascending order
-    --allow-legacy-curl                            Allow the script to run with an older version of curl
+    --allow-legacy-curl                            Deprecated. Accepted and ignored; no longer needed
 
 Internal Flags:
     --internal-build-stage <BUILD_STAGE>           (Internal only) Falcon Build Stage [release|stage] (Default: release)
@@ -228,30 +241,12 @@ while [ $# != 0 ]; do
     shift
 done
 
-# Check if curl is greater or equal to 7.55
-old_curl=$(
-    version=$(curl --version | head -n 1 | awk '{ print $2 }')
-    minimum="7.55"
+if ! command -v curl >/dev/null 2>&1; then
+    die "The 'curl' command is missing. Please install it before continuing. Aborting..."
+fi
 
-    # Check if the version is less than the minimum
-    if printf "%s\n" "$version" "$minimum" | sort -V -c >/dev/null 2>&1; then
-        echo 0
-    else
-        echo 1
-    fi
-)
-
-# Old curl print warning message
-if [ "$old_curl" -eq 0 ]; then
-    if [ "${ALLOW_LEGACY_CURL}" != "true" ]; then
-        echo """
-WARNING: Your version of curl does not support the ability to pass headers via stdin.
-For security considerations, we strongly recommend upgrading to curl 7.55.0 or newer.
-
-To bypass this warning, set the optional flag --allow-legacy-curl
-"""
-        exit 1
-    fi
+if [ "${ALLOW_LEGACY_CURL:-false}" = "true" ]; then
+    echo "NOTICE: ALLOW_LEGACY_CURL is no longer needed and is ignored." >&2
 fi
 
 # Handle error codes returned by curl
@@ -287,13 +282,15 @@ handle_curl_error() {
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    local token="$1"
-    set -- "$@"
-    if [ "$old_curl" -eq 0 ]; then
-        curl -s -L -H "Authorization: Bearer ${token}" "$@"
-    else
-        echo "Authorization: Bearer ${token}" | curl -s -L -H @- "$@"
-    fi
+    local token="$1" escaped_token auth_config
+    shift
+    # The configuration value must be quoted, because it holds a space and a
+    # colon. curl processes backslash escapes inside a quoted value, so a
+    # backslash or a double quote in the token has to be escaped first.
+    escaped_token=$(printf '%s' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    auth_config=$(printf 'header = "Authorization: Bearer %s"' "$escaped_token")
+    printf '%s\n' "$auth_config" |
+        curl -s -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 
 fetch_tags() {
@@ -875,8 +872,7 @@ docker_api_token=$(echo "$raw_docker_api_token" | json_value "token")
 
 ART_PASSWORD=$(echo "$docker_api_token" | sed 's/ *$//g' | sed 's/^ *//g')
 if [ -z "$ART_PASSWORD" ]; then
-    die "Failed to retrieve the CrowdStrike registry password. Response from API:
-$raw_docker_api_token
+    die "Failed to retrieve the CrowdStrike registry password.
 
 Ensure the following:
   - Correct API Scopes assigned for sensor type: ${SENSOR_TYPE}

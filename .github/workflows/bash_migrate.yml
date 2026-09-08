@@ -31,7 +31,7 @@ jobs:
       - name: Shellcheck
         run: |
           shellcheck --version
-          shellcheck bash/migrate/cs-migrate.sh
+          shellcheck bash/migrate/falcon-linux-migrate.sh
 
   molecule-test:
     name: Molecule Test

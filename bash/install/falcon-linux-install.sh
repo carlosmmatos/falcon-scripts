@@ -1,5 +1,21 @@
 #!/bin/bash
 
+case $- in
+    *x*)
+        set +x
+        printf '%s\n' 'WARNING: shell tracing disabled to protect credentials.' >&2
+        ;;
+esac
+
+falcon_client_secret=$FALCON_CLIENT_SECRET
+falcon_access_token=$FALCON_ACCESS_TOKEN
+falcon_provisioning_token=$FALCON_PROVISIONING_TOKEN
+unset FALCON_CLIENT_SECRET FALCON_ACCESS_TOKEN FALCON_PROVISIONING_TOKEN
+FALCON_CLIENT_SECRET=$falcon_client_secret
+FALCON_ACCESS_TOKEN=$falcon_access_token
+FALCON_PROVISIONING_TOKEN=$falcon_provisioning_token
+unset falcon_client_secret falcon_access_token falcon_provisioning_token
+
 print_usage() {
     cat <<EOF
 
@@ -82,7 +98,7 @@ Other Options
         The path to download the falcon sensor to.
 
     - ALLOW_LEGACY_CURL                 (default: false)
-        To use the legacy version of curl; version < 7.55.0.
+        Deprecated. Accepted and ignored; no longer needed.
 
     - GET_ACCESS_TOKEN                  (default: false)
         Prints an access token and exits.
@@ -305,7 +321,7 @@ cs_sensor_policy_version() {
     if echo "$sensor_update_policy" | grep "authorization failed"; then
         die "Access denied: Please make sure that your Falcon API credentials allow access to sensor update policies (scope Sensor update policies [read])"
     elif echo "$sensor_update_policy" | grep "invalid bearer token"; then
-        die "Invalid Access Token: $cs_falcon_oauth_token"
+        die "Invalid or expired Falcon access token."
     fi
 
     sensor_update_versions=$(echo "$sensor_update_policy" | json_value "sensor_version")
@@ -327,6 +343,33 @@ cs_sensor_policy_version() {
         echo "$1"
     fi
     IFS=$oldIFS
+}
+
+# Compare the downloaded installer against the SHA-256 that the API supplied.
+# That digest is the download id in the request URL, so this check finds
+# truncation and alteration in transit. It is not a signature check: the digest
+# and the file come from the same response, so it does not prove who built the
+# installer.
+verify_sha256() {
+    local file="$1" expected_sha="$2" local_sha
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        local_sha=$(sha256sum "$file" | awk '{ print $1 }')
+    elif command -v openssl >/dev/null 2>&1; then
+        local_sha=$(openssl dgst -sha256 "$file" | awk '{ print $NF }')
+    else
+        # Keep the file. The download is not known to be bad, only unverified.
+        die "Cannot verify the downloaded sensor installer: neither 'sha256sum' nor 'openssl' is available. Install one of them and try again. The download is kept at $file."
+        # die exits, so shellcheck reports the return below as unreachable and
+        # it is. Keep it anyway: if die ever stops exiting, control would reach
+        # the comparison with an empty digest and delete the file.
+        # shellcheck disable=SC2317
+        return 1
+    fi
+    if [ "$local_sha" != "$expected_sha" ]; then
+        rm -f "$file"
+        die "Downloaded sensor installer failed SHA-256 verification."
+    fi
 }
 
 cs_sensor_download() {
@@ -352,7 +395,7 @@ cs_sensor_download() {
     if echo "$existing_installers" | grep "authorization failed"; then
         die "Access denied: Please make sure that your Falcon API credentials allow sensor download (scope Sensor Download [read])"
     elif echo "$existing_installers" | grep "invalid bearer token"; then
-        die "Invalid Access Token: $cs_falcon_oauth_token"
+        die "Invalid or expired Falcon access token."
     fi
 
     sha_list=$(echo "$existing_installers" | json_value "sha256")
@@ -375,6 +418,8 @@ cs_sensor_download() {
     curl_command "https://$(cs_cloud)/sensors/entities/download-installer/v3?id=$sha" -o "${installer}"
 
     handle_curl_error $?
+
+    verify_sha256 "$installer" "$sha"
 
     echo "$installer"
 }
@@ -467,9 +512,9 @@ aws_ssm_parameter() {
 
     token=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
     api_endpoint="AmazonSSM.GetParameters"
-    iam_role="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
-    aws_my_region="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/placement/availability-zone | sed s/.$//)"
-    _security_credentials="$(curl -s -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")"
+    iam_role="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
+    aws_my_region="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/placement/availability-zone | sed s/.$//)"
+    _security_credentials="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")"
     access_key_id="$(echo "$_security_credentials" | grep AccessKeyId | sed -e 's/  "AccessKeyId" : "//' -e 's/",$//')"
     access_key_secret="$(echo "$_security_credentials" | grep SecretAccessKey | sed -e 's/  "SecretAccessKey" : "//' -e 's/",$//')"
     security_token="$(echo "$_security_credentials" | grep Token | sed -e 's/  "Token" : "//' -e 's/",$//')"
@@ -507,23 +552,24 @@ EOF
     )
 
     response=$(
-        curl -s "https://ssm.$aws_my_region.amazonaws.com/" \
-            -x "$proxy" \
-            -H "Authorization: AWS4-HMAC-SHA256 \
-            Credential=$access_key_id/$date/$aws_my_region/ssm/aws4_request, \
-            SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target, \
-            Signature=$signature" \
-            -H "x-amz-security-token: $security_token" \
-            -H "x-amz-target: $api_endpoint" \
-            -H "content-type: application/x-amz-json-1.1" \
-            -d "$request_data" \
-            -H "x-amz-date: $datetime"
+        {
+            printf 'header = "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s/%s/ssm/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target, Signature=%s"\n' \
+                "$access_key_id" "$date" "$aws_my_region" "$signature"
+            printf 'header = "x-amz-security-token: %s"\n' "$security_token"
+            printf 'header = "x-amz-target: %s"\n' "$api_endpoint"
+            printf 'header = "content-type: application/x-amz-json-1.1"\n'
+            printf 'header = "x-amz-date: %s"\n' "$datetime"
+        } | curl -s "https://ssm.$aws_my_region.amazonaws.com/" \
+            -x "$proxy" -K- \
+            -d "$request_data"
     )
     handle_curl_error $?
-    if ! echo "$response" | grep -q '^.*"InvalidParameters":\[\].*$'; then
-        die "Unexpected response from AWS SSM Parameter Store: $response"
-    elif ! echo "$response" | grep -q '^.*'"${param_name}"'.*$'; then
-        die "Unexpected response from AWS SSM Parameter Store: $response"
+    if ! echo "$response" | grep -q '^.*"InvalidParameters":\[\].*$' ||
+        ! echo "$response" | grep -q '^.*'"${param_name}"'.*$'; then
+        # The response body holds the decrypted parameter value, so report only
+        # the error message that AWS returns and never the body itself.
+        ssm_error=$(echo "$response" | json_value "message" 1)
+        die "Unexpected response from AWS SSM Parameter Store for parameter '$param_name'.${ssm_error:+ AWS reported: $ssm_error}"
     fi
     echo "$response"
 }
@@ -613,34 +659,12 @@ cs_cloud() {
     esac
 }
 
-# Check if curl is greater or equal to 7.55
-old_curl=$(
-    if ! command -v curl >/dev/null 2>&1; then
-        die "The 'curl' command is missing. Please install it before continuing. Aborting..."
-    fi
+if ! command -v curl >/dev/null 2>&1; then
+    die "The 'curl' command is missing. Please install it before continuing. Aborting..."
+fi
 
-    version=$(curl --version | head -n 1 | awk '{ print $2 }')
-    minimum="7.55"
-
-    # Check if the version is less than the minimum
-    if printf "%s\n" "$version" "$minimum" | sort -V -C; then
-        echo 0
-    else
-        echo 1
-    fi
-)
-
-# Old curl print warning message
-if [ "$old_curl" -eq 0 ]; then
-    if [ "${ALLOW_LEGACY_CURL}" != "true" ]; then
-        echo """
-WARNING: Your version of curl does not support the ability to pass headers via stdin.
-For security considerations, we strongly recommend upgrading to curl 7.55.0 or newer.
-
-To bypass this warning, set the environment variable ALLOW_LEGACY_CURL=true
-"""
-        exit 1
-    fi
+if [ "${ALLOW_LEGACY_CURL:-false}" = "true" ]; then
+    echo "NOTICE: ALLOW_LEGACY_CURL is no longer needed and is ignored." >&2
 fi
 
 # Handle error codes returned by curl
@@ -678,13 +702,14 @@ handle_curl_error() {
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    set -- "$@"
-
-    if [ "$old_curl" -eq 0 ]; then
-        curl -s -x "$proxy" -L -H "Authorization: Bearer ${cs_falcon_oauth_token}" "$@"
-    else
-        echo "Authorization: Bearer ${cs_falcon_oauth_token}" | curl -s -x "$proxy" -L -H @- "$@"
-    fi
+    local escaped_token auth_config
+    # The configuration value must be quoted, because it holds a space and a
+    # colon. curl processes backslash escapes inside a quoted value, so a
+    # backslash or a double quote in the token has to be escaped first.
+    escaped_token=$(printf '%s' "$cs_falcon_oauth_token" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    auth_config=$(printf 'header = "Authorization: Bearer %s"' "$escaped_token")
+    printf '%s\n' "$auth_config" |
+        curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
 }
 
 check_aws_instance() {
