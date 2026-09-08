@@ -359,8 +359,12 @@ get_oauth_token() {
                 auth_payload="${auth_payload}&member_cid=${cs_falcon_member_cid}"
             fi
 
+            # This POST body carries the client secret. Pin the scheme to https
+            # and do not follow redirects (-L removed): curl replays the request
+            # body on a 307/308 redirect, so following one could leak the secret
+            # to a redirect target. The token endpoint never legitimately redirects.
             token_result=$(echo "$auth_payload" |
-                curl -X POST -s -x "$proxy" -L "https://$(cs_cloud)/oauth2/token" \
+                curl -X POST -s -x "$proxy" --proto '=https' --proto-redir '=https' "https://$(cs_cloud)/oauth2/token" \
                     -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
                     -H "User-Agent: $(get_user_agent)" \
                     --dump-header "${response_headers}" \

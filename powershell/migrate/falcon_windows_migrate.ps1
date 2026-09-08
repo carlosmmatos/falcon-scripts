@@ -834,18 +834,104 @@ function Get-InstallerHash ([string] $Path) {
 }
 
 function Invoke-FalconDownload ([hashtable] $WebRequestParams, [string] $url, [string] $Outfile, [hashtable] $Headers) {
+    # Manual redirect follow: first hop may carry Authorization; CDN 302
+    # Location is fetched without Authorization.
+    $ProgressPreference = 'SilentlyContinue'
     try {
-        $ProgressPreference = 'SilentlyContinue'
-        $response = Invoke-WebRequest @WebRequestParams -Uri $url -UseBasicParsing -Method 'GET' -Headers $Headers -OutFile $Outfile
+        $response = Invoke-WebRequest @WebRequestParams -Uri $url -UseBasicParsing -Method 'GET' -Headers $Headers -OutFile $Outfile -MaximumRedirection 0
     }
     catch {
         $response = $_.Exception.Response
         if (!$response) {
+            # pwsh refuses HTTPS→HTTP before exposing Response; treat as policy deny.
+            if ("$($_.FullyQualifiedErrorId)$($_.ErrorDetails)" -match 'InsecureRedirection|insecure redirection') {
+                $message = "Refusing to follow non-HTTPS download redirect from ${url}"
+                Write-FalconLog 'DownloadFile' $message
+                throw $message
+            }
             $message = "Unhandled error occurred. Error: $($_.Exception.Message)"
             Write-FalconLog 'DownloadFile' $message
             throw $message
         }
-        if ($response.StatusCode -eq 403) {
+
+        $statusCode = [int]$response.StatusCode
+        if ($statusCode -in @(301, 302, 303, 307, 308)) {
+            $location = $null
+            if ($response.Headers.Location) {
+                $location = $response.Headers.Location.ToString()
+            }
+            elseif ($response.Headers.Contains('Location')) {
+                $location = @($response.Headers.GetValues('Location'))[0]
+            }
+            if ([string]::IsNullOrWhiteSpace($location)) {
+                $message = "Download redirected without a Location header from ${url}"
+                Write-FalconLog 'DownloadFile' $message
+                throw $message
+            }
+
+            $redirectUri = [System.Uri]::new([System.Uri]$url, $location)
+            if ($redirectUri.Scheme -ne 'https') {
+                $message = "Refusing to follow non-HTTPS download redirect to $($redirectUri.AbsoluteUri)"
+                Write-FalconLog 'DownloadFile' $message
+                throw $message
+            }
+
+            $FollowParams = @{}
+            foreach ($key in $WebRequestParams.Keys) {
+                if ($key -eq 'Headers') {
+                    $paramHeaders = @{}
+                    foreach ($headerName in $WebRequestParams.Headers.Keys) {
+                        if ($headerName -ne 'Authorization') {
+                            $paramHeaders[$headerName] = $WebRequestParams.Headers[$headerName]
+                        }
+                    }
+                    if ($paramHeaders.Count -gt 0) {
+                        $FollowParams['Headers'] = $paramHeaders
+                    }
+                }
+                else {
+                    $FollowParams[$key] = $WebRequestParams[$key]
+                }
+            }
+
+            $strippedHeaders = @{}
+            if ($Headers) {
+                foreach ($headerName in $Headers.Keys) {
+                    if ($headerName -ne 'Authorization') {
+                        $strippedHeaders[$headerName] = $Headers[$headerName]
+                    }
+                }
+            }
+
+            try {
+                if ($strippedHeaders.Count -gt 0) {
+                    $null = Invoke-WebRequest @FollowParams -Uri $redirectUri.AbsoluteUri -UseBasicParsing -Method 'GET' -Headers $strippedHeaders -OutFile $Outfile
+                }
+                else {
+                    $null = Invoke-WebRequest @FollowParams -Uri $redirectUri.AbsoluteUri -UseBasicParsing -Method 'GET' -OutFile $Outfile
+                }
+            }
+            catch {
+                $followResponse = $_.Exception.Response
+                if (!$followResponse) {
+                    $message = "Unhandled error occurred following download redirect. Error: $($_.Exception.Message)"
+                    Write-FalconLog 'DownloadFile' $message
+                    throw $message
+                }
+                if ([int]$followResponse.StatusCode -eq 403) {
+                    $scope = @{
+                        'Sensor Download' = @('Read')
+                    }
+                    $message = Format-403Error -url $redirectUri.AbsoluteUri -scope $scope
+                    Write-FalconLog 'Permissions' $message
+                    throw $message
+                }
+                $message = "Received a $($followResponse.StatusCode) response from $($redirectUri.AbsoluteUri). Error: $($_.Exception.Message)"
+                Write-FalconLog 'DownloadFile' $message
+                throw $message
+            }
+        }
+        elseif ($statusCode -eq 403) {
             $scope = @{
                 'Sensor Download' = @('Read')
             }
@@ -854,7 +940,7 @@ function Invoke-FalconDownload ([hashtable] $WebRequestParams, [string] $url, [s
             throw $message
         }
         else {
-            $message = "Received a $($response.StatusCode) response from ${url}. Error: $($response.StatusDescription)"
+            $message = "Received a $($response.StatusCode) response from ${url}. Error: $($_.Exception.Message)"
             Write-FalconLog 'DownloadFile' $message
             throw $message
         }
@@ -1007,7 +1093,7 @@ function Invoke-FalconAuth([hashtable] $WebRequestParams, [string] $BaseUrl, [ha
     $Headers = @{'Accept' = 'application/json'; 'Content-Type' = 'application/x-www-form-urlencoded'; 'charset' = 'utf-8' }
     $Headers.Add('User-Agent', $FullUserAgent)
     try {
-        $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body
+        $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body -MaximumRedirection 0
         $content = ConvertFrom-Json -InputObject $response.Content
 
         if ([string]::IsNullOrEmpty($content.access_token)) {

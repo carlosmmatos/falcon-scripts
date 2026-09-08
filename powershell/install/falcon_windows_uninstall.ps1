@@ -200,7 +200,7 @@ begin {
         }
         else {
             try {
-                $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body
+                $response = Invoke-WebRequest @WebRequestParams -Uri "$($BaseUrl)/oauth2/token" -UseBasicParsing -Method 'POST' -Headers $Headers -Body $Body -MaximumRedirection 0
                 $content = ConvertFrom-Json -InputObject $response.Content
 
                 if ([string]::IsNullOrEmpty($content.access_token)) {
