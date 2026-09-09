@@ -194,9 +194,7 @@ cs_remove_host_from_console() {
         payload="{\"ids\": [\"$aid\"]}"
         url="https://$(cs_cloud)/devices/entities/devices-actions/v2?action_name=hide_host"
 
-        curl_command -X "POST" -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null
-
-        handle_curl_error $?
+        curl_command -X "POST" -H "Content-Type: application/json" -d "$payload" "$url" >/dev/null || handle_curl_error $?
     fi
 }
 
@@ -234,9 +232,7 @@ get_maintenance_token() {
     payload="{\"device_id\": \"$aid\", \"audit_message\": \"CrowdStrike Falcon Uninstall Bash Script\"}"
     url="https://$(cs_cloud)/policy/combined/reveal-uninstall-token/v1"
 
-    response=$(curl_command -X "POST" -H "Content-Type: application/json" -d "$payload" "$url")
-
-    handle_curl_error $?
+    response=$(curl_command -X "POST" -H "Content-Type: application/json" -d "$payload" "$url") || handle_curl_error $?
 
     if echo "$response" | grep -q "\"uninstall_token\""; then
         cs_maintenance_token=$(echo "$response" | json_value "uninstall_token" 1 | sed 's/ *$//g' | sed 's/^ *//g')
@@ -343,7 +339,7 @@ if [ "${ALLOW_LEGACY_CURL:-false}" = "true" ]; then
 fi
 
 aws_ssm_parameter() {
-    local param_name="$1"
+    local param_name="$1" imds_err
 
     hmac_sha256() {
         key="$1"
@@ -351,11 +347,12 @@ aws_ssm_parameter() {
         echo -n "$data" | openssl dgst -sha256 -mac HMAC -macopt "$key" | sed 's/^.* //'
     }
 
-    token=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+    imds_err="Failed to query the EC2 instance metadata service. Reading an SSM parameter needs IMDSv2 access from this host."
+    token=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") || die "$imds_err (curl exit $?)"
     api_endpoint="AmazonSSM.GetParameters"
-    iam_role="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/)"
+    iam_role="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/)" || die "$imds_err (curl exit $?)"
     aws_my_region="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/placement/availability-zone | sed s/.$//)"
-    _security_credentials="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")"
+    _security_credentials="$(printf 'header = "X-aws-ec2-metadata-token: %s"\n' "$token" | curl -s -K- http://169.254.169.254/latest/meta-data/iam/security-credentials/"$iam_role")" || die "$imds_err (curl exit $?)"
     access_key_id="$(echo "$_security_credentials" | grep AccessKeyId | sed -e 's/  "AccessKeyId" : "//' -e 's/",$//')"
     access_key_secret="$(echo "$_security_credentials" | grep SecretAccessKey | sed -e 's/  "SecretAccessKey" : "//' -e 's/",$//')"
     security_token="$(echo "$_security_credentials" | grep Token | sed -e 's/  "Token" : "//' -e 's/",$//')"
@@ -403,8 +400,7 @@ EOF
         } | curl -s "https://ssm.$aws_my_region.amazonaws.com/" \
             -x "$proxy" -K- \
             -d "$request_data"
-    )
-    handle_curl_error $?
+    ) || handle_curl_error $?
     if ! echo "$response" | grep -q '^.*"InvalidParameters":\[\].*$' ||
         ! echo "$response" | grep -q '^.*'"${param_name}"'.*$'; then
         # The response body holds the decrypted parameter value, so report only
@@ -426,7 +422,8 @@ check_aws_instance() {
         aws_instance=true
     # Check if EC2 instance identity document is accessible
     else
-        curl_output="$(curl -s --connect-timeout 5 http://169.254.169.254/latest/dynamic/instance-identity/)"
+        # A probe failure means this is not an EC2 instance, so keep going.
+        curl_output="$(curl -s --connect-timeout 5 http://169.254.169.254/latest/dynamic/instance-identity/ || true)"
         if [ -n "$curl_output" ] && ! echo "$curl_output" | grep --silent -i 'not.*found'; then
             aws_instance=true
         fi
@@ -491,9 +488,7 @@ get_oauth_token() {
         else
             auth_payload="client_id=$cs_falcon_client_id&client_secret=$cs_falcon_client_secret"
 
-            token_result=$(echo "$auth_payload" | oauth_token_request "$(cs_cloud)" "${response_headers}")
-
-            handle_curl_error $?
+            token_result=$(echo "$auth_payload" | oauth_token_request "$(cs_cloud)" "${response_headers}") || handle_curl_error $?
 
             token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
             if [ -z "$token" ]; then
@@ -508,8 +503,7 @@ get_oauth_token() {
                         # Separate file: --dump-header truncates, and region_hint below
                         # still needs the original response.
                         retry_headers=$(mktemp)
-                        token_result=$(echo "$auth_payload" | oauth_token_request "$retry_host" "$retry_headers")
-                        handle_curl_error $?
+                        token_result=$(echo "$auth_payload" | oauth_token_request "$retry_host" "$retry_headers") || handle_curl_error $?
                         rm -f "$retry_headers"
                         token=$(echo "$token_result" | json_value "access_token" | sed 's/ *$//g' | sed 's/^ *//g')
                     fi
