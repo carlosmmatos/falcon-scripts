@@ -704,14 +704,54 @@ handle_curl_error() {
 
 curl_command() {
     # Dash does not support arrays, so we have to pass the args as separate arguments
-    local escaped_token auth_config
+    local escaped_token auth_config headers body status hint old_host new_host arg rc
     # The configuration value must be quoted, because it holds a space and a
     # colon. curl processes backslash escapes inside a quoted value, so a
     # backslash or a double quote in the token has to be escaped first.
     escaped_token=$(printf '%s' "$cs_falcon_oauth_token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     auth_config=$(printf 'header = "Authorization: Bearer %s"' "$escaped_token")
+
+    headers=$(mktemp)
+    body=$(mktemp)
+    # No -L: the bearer token must never cross a redirect hop. The body is held
+    # back so that a redirect body is not emitted ahead of the retry's.
     printf '%s\n' "$auth_config" |
-        curl -s -x "$proxy" -L --proto '=https' --proto-redir '=https' -K- "$@"
+        curl -s -x "$proxy" --proto '=https' --dump-header "$headers" -K- "$@" >"$body"
+    rc=$?
+
+    # A wrong region answers with a redirect naming the right one in x-cs-region.
+    # Re-issue against that region instead of following Location. Take the last
+    # status line, because a proxy CONNECT dumps one of its own first.
+    status=$(awk '/^HTTP\//{s=$2} END{print s}' "$headers")
+    case "$status" in
+        301 | 302 | 307 | 308)
+            hint=$(grep -i ^x-cs-region: "$headers" | head -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r' | sed 's/^x-cs-region: //g')
+            if [ -n "$hint" ]; then
+                old_host=$(cs_cloud)
+                # cs_cloud() validates the hint against its own allowlist. Check
+                # for empty rather than trusting its die, which does not stop bash.
+                new_host=$(cs_cloud "$hint")
+                if [ -n "$new_host" ] && [ "$new_host" != "$old_host" ]; then
+                    for arg in "$@"; do
+                        shift
+                        case "$arg" in
+                            "https://$old_host/"*)
+                                arg="https://$new_host/${arg#"https://$old_host/"}"
+                                ;;
+                        esac
+                        set -- "$@" "$arg"
+                    done
+                    printf '%s\n' "$auth_config" |
+                        curl -s -x "$proxy" --proto '=https' -K- "$@" >"$body"
+                    rc=$?
+                fi
+            fi
+            ;;
+    esac
+
+    cat "$body"
+    rm -f "$headers" "$body"
+    return "$rc"
 }
 
 check_aws_instance() {
@@ -829,10 +869,11 @@ get_oauth_token() {
                 die "Unable to obtain region hint from CrowdStrike Falcon OAuth API, Please provide FALCON_CLOUD environment variable as an override."
             fi
             cs_falcon_cloud="${region_hint}"
-        else
-            if [ "${FALCON_CLOUD}" != "${region_hint}" ]; then
-                echo "WARNING: FALCON_CLOUD='${FALCON_CLOUD}' environment variable specified while credentials only exists in '${region_hint}'" >&2
-            fi
+        elif [ -n "${region_hint}" ] && [ "${FALCON_CLOUD}" != "${region_hint}" ]; then
+            echo "WARNING: FALCON_CLOUD='${FALCON_CLOUD}' environment variable specified while credentials only exists in '${region_hint}'" >&2
+            # Use the hint. The API answers the wrong region with a redirect, which
+            # curl_command no longer follows.
+            cs_falcon_cloud="${region_hint}"
         fi
     fi
 
